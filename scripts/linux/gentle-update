@@ -5,7 +5,7 @@
 #
 #   agents     AI coding agents and their runtimes -> latest stable.
 #              Claude Code, Codex, OpenCode, Pi runtime, Gentle Shell, herdr.
-#   toolchain  Gentleman source builds pinned to the tip of main.
+#   toolchain  Gentleman tools -> latest official release (never main).
 #              gentle-ai and engram; the standalone Gentle Shell home is
 #              provisioned by its launcher instead of syncing the regular Pi home.
 #   plugins    Claude Code marketplaces and installed plugins.
@@ -30,8 +30,11 @@
 set -uo pipefail
 
 BIN_DIR="${GENTLE_UPDATE_BIN_DIR:-$HOME/.local/bin}"
-GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v3/cmd/gentle-ai@main"
-ENGRAM_PKG="github.com/Gentleman-Programming/engram/v2/cmd/engram@main"
+# Module paths carry the major version and change on every major release:
+# when a new major ships, bump /v4 and /v3 here. `@latest` resolves to the
+# newest tagged release and never to a prerelease or main.
+GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@latest"
+ENGRAM_PKG="github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 # The npm package name remains gentle-pi; it installs the gentle-shell command.
 GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
 PNPM_GLOBAL_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
@@ -84,8 +87,8 @@ report_versions() {
 
 # --- toolchain ---------------------------------------------------------------
 
-# Build a Go binary from main into BIN_DIR, keeping one rolling backup.
-install_from_main() {
+# Build a Go binary from a release into BIN_DIR, keeping one rolling backup.
+install_release() {
   local name="$1" pkg="$2" target="$BIN_DIR/$1"
 
   if [ -f "$target" ]; then
@@ -243,6 +246,32 @@ check_pi_homes() {
   done
 }
 
+# `gentle-shell --isolated setup` re-adds an unpinned companion package (for
+# example npm:gentle-engram) next to the pinned one it also writes, and Pi then
+# fails to load the duplicated tool. Drop the bare entry only when a pinned entry
+# for the same package exists in the Gentle Shell home, and say so out loud.
+dedupe_gentle_shell_home() {
+  command -v jq >/dev/null 2>&1 || return 0
+  local file="${GENTLE_SHELL_HOME:-$HOME/.gentle-shell/agent}/settings.json"
+  [ -f "$file" ] || return 0
+
+  local before after tmp
+  before="$(jq -c '.packages // []' "$file" 2>/dev/null)" || return 0
+  tmp="$(mktemp)" || return 0
+  jq '.packages as $p
+      | .packages = [ $p[]? | select(
+          (type != "string") or (test("^npm:[^@]+$") | not)
+          or ((. + "@") as $bare | any($p[]?; type == "string" and startswith($bare)) | not)
+        ) ]' "$file" > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
+  after="$(jq -c '.packages // []' "$tmp")"
+
+  if [ "$before" != "$after" ]; then
+    cat "$tmp" > "$file"
+    ok "removed duplicate unpinned package(s) from the Gentle Shell home: $before -> $after"
+  fi
+  rm -f "$tmp"
+}
+
 # --- main --------------------------------------------------------------------
 
 case "$TARGET" in
@@ -285,9 +314,9 @@ if wants agents; then
 fi
 
 if wants toolchain; then
-  heading "Gentleman toolchain (tip of main)"
-  step "gentle-ai" go install_from_main gentle-ai "$GENTLE_AI_PKG"
-  step "engram"    go install_from_main engram    "$ENGRAM_PKG"
+  heading "Gentleman toolchain (latest release)"
+  step "gentle-ai" go install_release gentle-ai "$GENTLE_AI_PKG"
+  step "engram"    go install_release engram    "$ENGRAM_PKG"
   sync_gentle_ai_dev_override
 fi
 
@@ -312,6 +341,7 @@ fi
 
 hash -r 2>/dev/null || true
 
+dedupe_gentle_shell_home
 check_pi_homes
 
 bold "After"
