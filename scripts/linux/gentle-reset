@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# gentle-reset — restart every local tool from a clean slate, without data loss.
+#
+# Companion to gentle-update. Where gentle-update installs new builds, this
+# clears the stale state and long-lived processes that keep the old ones alive.
+#
+# Groups:
+#
+#   state    Bookkeeping that outlived the process which wrote it.
+#            engram's unclosed session rows, leftover upgrade staging dirs.
+#   caches   Regenerable package-manager caches and agent scratchpads.
+#   daemons  Long-lived servers, stopped so the next launch picks up whatever
+#            `update` installs.
+#   update   Delegates to gentle-update.
+#
+# Order matters. State and caches are cleaned first, daemons stop next so their
+# binaries can be replaced, and `update` runs last so every process started
+# afterwards loads the new builds.
+#
+# NEVER touched, because none of it is garbage:
+#
+#   ~/.cache/qmd/models   Multi-GB of downloaded embedding models. Deleting
+#                         them forces a full re-download and re-embed.
+#   ~/.cache/puppeteer    The Chrome build chrome-devtools-mcp drives.
+#   ~/.cache/go-build     Content-addressed, so a stale entry can never produce
+#                         a wrong binary. Clearing it only costs rebuild time.
+#   ~/.claude/projects    Session transcripts — the source for `claude --resume`.
+#   Any config, credential, or database file.
+#
+# MCP servers (qmd, codegraph, context7, chrome-devtools, engram mcp) are
+# children of the agent that spawned them and exit with it. Close your agents
+# instead of killing those individually.
+#
+# Usage:
+#   gentle-reset [all|state|caches|daemons|update] [--dry-run] [--force]
+#
+#   --dry-run  Print every mutation without performing it.
+#   --force    Kill herdr clients, and their mosh-server parents, that survive
+#              a graceful server stop. This drops live mosh connections.
+#
+# Safe to run from inside a herdr session. herdr will not stop its own server
+# from within one of its sessions, so that single step is skipped and reported;
+# every other step runs normally. gentle-update already skips herdr's own
+# self-update the same way, so the `update` group needs no special handling.
+#
+# Each step is isolated: a failure is reported at the end and never stops the
+# remaining steps.
+
+set -uo pipefail
+
+TARGET=""
+DRY_RUN=0
+FORCE=0
+FAILED=()
+SKIPPED=()
+
+bold()    { printf '\n\033[1m%s\033[0m\n' "$*"; }
+heading() { printf '\n\033[1;35m── %s ──\033[0m\n' "$*"; }
+ok()      { printf '\033[32m✓\033[0m %s\n' "$*"; }
+warn()    { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+
+skip() {
+  SKIPPED+=("$1")
+  warn "$1"
+}
+
+# Perform one mutation, or describe it under --dry-run.
+run() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  \033[2mwould run:\033[0m %s\n' "$*"
+    return 0
+  fi
+  "$@"
+}
+
+# Run one reset step. Records failures instead of aborting the run, and skips
+# cleanly when the tool is not installed on this machine.
+step() {
+  local name="$1"; shift
+  local binary="$1"; shift
+
+  if [ "$binary" != "-" ] && ! command -v "$binary" >/dev/null 2>&1; then
+    skip "$name — not installed ('$binary' is not on PATH)"
+    return 0
+  fi
+
+  printf '\n\033[1m%s\033[0m\n' "$name"
+  if "$@"; then
+    ok "$name"
+  else
+    FAILED+=("$name")
+    warn "$name — failed"
+  fi
+}
+
+# Delete one regenerable path, reporting what it was worth.
+reclaim() {
+  local label="$1" path="$2" size
+  if [ ! -e "$path" ]; then
+    skip "$label — nothing at $path"
+    return 0
+  fi
+  size="$(du -sh "$path" 2>/dev/null | awk '{print $1}')"
+  printf '  %s (%s)\n' "$path" "${size:-?}"
+  run rm -rf "$path"
+}
+
+home_free() { df -h --output=avail "$HOME" 2>/dev/null | awk 'NR==2 {print $1}'; }
+
+# --- state -------------------------------------------------------------------
+
+# engram refuses to save while a project has session rows left open by a crashed
+# or killed agent. The leak checker is the supported way to close them.
+reset_engram_sessions() {
+  if ! command -v engram-leak-check >/dev/null 2>&1; then
+    skip "engram sessions — engram-leak-check is not on PATH"
+    return 0
+  fi
+  run engram-leak-check --fix
+}
+
+# Upgrade staging directories are named after the version they staged, so any
+# directory not matching the installed build is finished work.
+reset_engram_upgrade_staging() {
+  local dir found=0
+  for dir in "$HOME"/.cache/engram-upgrade-*; do
+    [ -d "$dir" ] || continue
+    found=1
+    reclaim "engram upgrade staging" "$dir"
+  done
+  [ "$found" = 1 ] || skip "engram upgrade staging — none left behind"
+}
+
+# --- caches ------------------------------------------------------------------
+
+reset_npm_caches() {
+  run npm cache clean --force || return 1
+  reclaim "npx package cache" "$HOME/.npm/_npx"
+}
+
+reset_pnpm_store() {
+  run pnpm store prune
+}
+
+# Agent scratchpads are recreated per session. Only safe once the agents that
+# own them have exited, which is why this group runs before `daemons`.
+reset_agent_scratchpads() {
+  local live
+  live="$(pgrep -u "$(id -u)" -x claude 2>/dev/null | tr '\n' ' ')"
+  if [ -n "$live" ]; then
+    skip "agent scratchpads — Claude Code is still running (pids: ${live% }); close it first"
+    return 0
+  fi
+  reclaim "agent scratchpads" "/tmp/claude-$(id -u)"
+}
+
+# --- daemons -----------------------------------------------------------------
+
+# herdr clients exit when the server goes away, and a mosh-server follows its
+# child shell out. Anything still alive after that is genuinely orphaned, so it
+# is reported rather than killed unless --force says otherwise.
+reap_herdr_orphans() {
+  local -a pids=()
+  local pid parent
+  while read -r pid; do
+    [ -n "$pid" ] || continue
+    pids+=("$pid")
+  done < <(pgrep -x herdr 2>/dev/null)
+
+  if [ ${#pids[@]} -eq 0 ]; then
+    ok "no herdr processes left"
+    return 0
+  fi
+
+  if [ "$FORCE" != 1 ]; then
+    skip "herdr — ${#pids[@]} process(es) survived the stop (${pids[*]}); re-run with --force"
+    return 0
+  fi
+
+  for pid in "${pids[@]}"; do
+    parent="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    printf '  killing herdr %s\n' "$pid"
+    run kill "$pid" 2>/dev/null
+    if [ -n "$parent" ] && ps -o comm= -p "$parent" 2>/dev/null | rg -q mosh-server; then
+      printf '  killing orphaned mosh-server %s\n' "$parent"
+      run kill "$parent" 2>/dev/null
+    fi
+  done
+}
+
+stop_herdr() {
+  local name
+  while read -r name; do
+    [ -n "$name" ] || continue
+    printf '  stopping session %s\n' "$name"
+    run herdr session stop "$name"
+  done < <(herdr session list 2>/dev/null | awk 'NR>1 && $2 == "running" { print $1 }')
+
+  run herdr server stop
+  # A dry run never stopped the server, so every process would look orphaned.
+  [ "$DRY_RUN" = 1 ] && return 0
+  sleep 2
+  reap_herdr_orphans
+}
+
+# `engram serve` has no stop subcommand; it is restarted on demand by whatever
+# next needs the HTTP API.
+stop_engram_serve() {
+  if ! pgrep -f 'engram serve' >/dev/null 2>&1; then
+    skip "engram serve — not running"
+    return 0
+  fi
+  run pkill -f 'engram serve'
+  ok "engram serve stopped — it restarts on demand"
+}
+
+# --- main --------------------------------------------------------------------
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --force)   FORCE=1 ;;
+    all|state|caches|daemons|update)
+      if [ -n "$TARGET" ]; then
+        printf 'gentle-reset: one target at a time (got %s and %s)\n' "$TARGET" "$1" >&2
+        exit 2
+      fi
+      TARGET="$1"
+      ;;
+    *)
+      printf 'usage: gentle-reset [all|state|caches|daemons|update] [--dry-run] [--force]\n' >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+TARGET="${TARGET:-all}"
+
+# herdr will not stop its own server from inside one of its sessions, so that
+# one step is reported as skipped rather than aborting the whole run. A dry run
+# applies the same rule so it predicts what the real run will actually do.
+IN_HERDR=0
+if [ -n "${HERDR_ENV:-}" ]; then
+  IN_HERDR=1
+fi
+
+wants() { [ "$TARGET" = all ] || [ "$TARGET" = "$1" ]; }
+
+if [ "$DRY_RUN" = 1 ]; then
+  bold "Dry run — nothing will be changed"
+fi
+
+FREE_BEFORE="$(home_free)"
+
+if wants state; then
+  heading "Stale state"
+  step "engram sessions"        - reset_engram_sessions
+  step "engram upgrade staging" - reset_engram_upgrade_staging
+fi
+
+if wants caches; then
+  heading "Regenerable caches"
+  step "npm caches"        npm  reset_npm_caches
+  step "pnpm store"        pnpm reset_pnpm_store
+  step "agent scratchpads" -    reset_agent_scratchpads
+fi
+
+if wants daemons; then
+  heading "Long-lived daemons"
+  if [ "$IN_HERDR" = 1 ]; then
+    skip "herdr — NOT reset: this shell is inside a herdr session (HERDR_ENV is set)"
+    warn "  herdr cannot stop its own server from within one of its sessions."
+    warn "  Every other step still ran. To reset herdr too: detach with the herdr"
+    warn "  prefix followed by 'q', then run 'gentle-reset daemons' from the shell"
+    warn "  you land in."
+  else
+    step "herdr" herdr stop_herdr
+  fi
+  step "engram serve" engram stop_engram_serve
+fi
+
+if wants update; then
+  heading "Updates"
+  step "gentle-update" gentle-update run gentle-update
+fi
+
+hash -r 2>/dev/null || true
+
+if [ ${#SKIPPED[@]} -gt 0 ]; then
+  bold "Skipped"
+  printf '  • %s\n' "${SKIPPED[@]}"
+fi
+
+bold "Disk"
+printf '  available in %s: %s -> %s\n' "$HOME" "${FREE_BEFORE:-?}" "$(home_free)"
+
+if [ ${#FAILED[@]} -gt 0 ]; then
+  bold "Failed"
+  printf '  • %s\n' "${FAILED[@]}"
+  exit 1
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+  bold "Dry run complete — nothing was changed. Drop --dry-run to apply."
+else
+  if [ "$IN_HERDR" = 1 ] && wants daemons; then
+    bold "Done — but herdr is still running the build it started with."
+    printf '  Detach and run %s to pick up the new one.\n' "'gentle-reset daemons'"
+  else
+    bold "Done — start herdr, then your agents, so they load the new builds."
+  fi
+fi

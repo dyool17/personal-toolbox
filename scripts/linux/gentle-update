@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# gentle-update — refresh every local development tool in one command.
+#
+# Groups, because they track deliberately different things:
+#
+#   agents     AI coding agents and their runtimes -> latest stable.
+#              Claude Code, Codex, OpenCode, Pi runtime, Gentle Shell, herdr.
+#   toolchain  Gentleman source builds pinned to the tip of main.
+#              gentle-ai and engram; the standalone Gentle Shell home is
+#              provisioned by its launcher instead of syncing the regular Pi home.
+#   plugins    Claude Code marketplaces and installed plugins.
+#   packages   Global package managers and standalone binaries.
+#              npm globals, pnpm globals, moshi-hook, mise itself.
+#   runtimes   Language runtimes managed by mise. NOT part of `all` — see below.
+#
+# The standalone launcher is updated before its isolated home is provisioned.
+# The PATH Pi runtime is updated separately; Gentle Shell does not update Pi itself.
+#
+# `runtimes` is opt-in on purpose. mise installs each runtime into its own
+# directory and npm globals do not carry across Node versions, so bumping Node
+# silently orphans every globally installed CLI. Run it when you are ready to
+# reinstall those, not as part of a routine refresh.
+#
+# Usage:
+#   gentle-update [all|agents|toolchain|plugins|packages|runtimes]
+#
+# Each step is isolated: a failing tool is reported at the end and never stops
+# the remaining tools from updating.
+
+set -uo pipefail
+
+BIN_DIR="${GENTLE_UPDATE_BIN_DIR:-$HOME/.local/bin}"
+GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v3/cmd/gentle-ai@main"
+ENGRAM_PKG="github.com/Gentleman-Programming/engram/v2/cmd/engram@main"
+# The npm package name remains gentle-pi; it installs the gentle-shell command.
+GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
+PNPM_GLOBAL_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
+
+TARGET="${1:-all}"
+FAILED=()
+SKIPPED=()
+
+bold()    { printf '\n\033[1m%s\033[0m\n' "$*"; }
+heading() { printf '\n\033[1;35m── %s ──\033[0m\n' "$*"; }
+ok()      { printf '\033[32m✓\033[0m %s\n' "$*"; }
+warn()    { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+
+skip() {
+  SKIPPED+=("$1")
+  warn "$1"
+}
+
+# Run one update step. Records failures instead of aborting the run, and skips
+# cleanly when the tool is not installed on this machine.
+step() {
+  local name="$1"; shift
+  local binary="$1"; shift
+
+  if ! command -v "$binary" >/dev/null 2>&1; then
+    skip "$name — not installed ('$binary' is not on PATH)"
+    return 0
+  fi
+
+  printf '\n\033[1m%s\033[0m\n' "$name"
+  if "$@"; then
+    ok "$name"
+  else
+    FAILED+=("$name")
+    warn "$name — update failed"
+  fi
+}
+
+version_of() {
+  command -v "$1" >/dev/null 2>&1 || { echo "—"; return; }
+  "$1" --version 2>/dev/null | head -1 | tr -d '\r' || echo "unknown"
+}
+
+report_versions() {
+  local t
+  for t in claude codex opencode pi gentle-shell herdr gentle-ai engram mise qmd; do
+    printf '  %-12s %s\n' "$t" "$(version_of "$t")"
+  done
+}
+
+# --- toolchain ---------------------------------------------------------------
+
+# Build a Go binary from main into BIN_DIR, keeping one rolling backup.
+install_from_main() {
+  local name="$1" pkg="$2" target="$BIN_DIR/$1"
+
+  if [ -f "$target" ]; then
+    cp -a "$target" "$target.prev" || return 1
+  fi
+
+  # A throwaway working directory keeps the build out of any local Go module.
+  local workdir
+  workdir="$(mktemp -d)" || return 1
+  ( cd "$workdir" && GOBIN="$BIN_DIR" GOFLAGS= go install "$pkg" )
+  local status=$?
+  rm -rf "$workdir"
+  [ $status -eq 0 ] || return $status
+
+  # Remove copies in earlier PATH directories that would shadow BIN_DIR.
+  local gobin gopath dir
+  gobin="$(go env GOBIN)"
+  gopath="$(go env GOPATH)/bin"
+  for dir in "$gobin" "$gopath"; do
+    if [ -n "$dir" ] && [ "$dir" != "$BIN_DIR" ] && [ -f "$dir/$name" ]; then
+      rm -f "$dir/$name"
+    fi
+  done
+}
+
+# gentle-pi can be pinned to a locally built gentle-ai through a registration
+# file, and it refuses to fall back silently while that override is declared.
+# Rebuilding gentle-ai into BIN_DIR removes the shadowing copy the override may
+# still name, so repair a *broken* override here. An override whose binary
+# still exists is a deliberate choice and is never redirected.
+sync_gentle_ai_dev_override() {
+  local config_home="${GENTLE_PI_CONFIG_HOME:-$HOME/.pi/gentle-ai}"
+  local file="$config_home/dev-binary.json"
+  local target="$BIN_DIR/gentle-ai"
+
+  [ -f "$file" ] || return 0
+  [ -x "$target" ] || return 0
+
+  local declared
+  declared="$(rg -o '"path"[[:space:]]*:[[:space:]]*"[^"]+"' "$file" 2>/dev/null | rg -o '/[^"]+')"
+  [ -n "$declared" ] || return 0
+  [ -e "$declared" ] && return 0
+
+  printf '{"schema": "gentle-pi.dev-binary/v1", "path": "%s"}\n' "$target" > "$file"
+  ok "repaired gentle-pi dev binary override -> $target"
+}
+
+install_gentle_shell() {
+  npm install --global "${GENTLE_SHELL_NPM_PACKAGE}@latest" || return 1
+  hash -r 2>/dev/null || true
+}
+
+# --- agents ------------------------------------------------------------------
+
+# herdr manages the terminal this script usually runs in and refuses to replace
+# its own binary from inside one of its sessions. Detect that rather than
+# reporting it as a breakage.
+update_herdr() {
+  if ! command -v herdr >/dev/null 2>&1; then
+    skip "herdr — not installed"
+    return 0
+  fi
+  if [ -n "${HERDR_ENV:-}" ]; then
+    skip "herdr — run 'herdr update' from a terminal outside herdr"
+    return 0
+  fi
+  step "herdr" herdr herdr update
+}
+
+# --- plugins -----------------------------------------------------------------
+
+update_claude_plugins() {
+  claude plugin marketplace update || return 1
+
+  local plugin status=0
+  while read -r plugin; do
+    [ -n "$plugin" ] || continue
+    printf '  updating %s\n' "$plugin"
+    claude plugin update "$plugin" || status=1
+  done < <(claude plugin list 2>/dev/null | rg -o '[A-Za-z0-9_-]+@[A-Za-z0-9_-]+')
+
+  return $status
+}
+
+# --- packages ----------------------------------------------------------------
+
+# npm links bin names in install order, and corepack declares `pnpm` and `pnpx`
+# just like pnpm does. After a global update corepack can end up owning those
+# names, which silently swaps the installed pnpm for whatever version corepack
+# resolves. Give them back to the package that is actually installed.
+restore_pnpm_bins() {
+  local npm_bin pkg name
+  npm_bin="$(dirname "$(command -v npm)")" || return 0
+  pkg="$npm_bin/../lib/node_modules/pnpm"
+  [ -d "$pkg" ] || return 0
+
+  for name in pnpm pnpx; do
+    if [ -e "$pkg/$name" ] && readlink "$npm_bin/$name" 2>/dev/null | rg -q corepack; then
+      ln -sf "../lib/node_modules/pnpm/$name" "$npm_bin/$name"
+      ok "restored '$name' to the installed pnpm (corepack had claimed it)"
+    fi
+  done
+}
+
+update_npm_globals() {
+  npm update -g || return 1
+  restore_pnpm_bins
+}
+
+# pnpm's global bin directory is not on this machine's PATH, which makes pnpm
+# refuse every global command. Supply it for the duration of the call only.
+update_pnpm_globals() {
+  if [ ! -d "$PNPM_GLOBAL_HOME" ]; then
+    skip "pnpm globals — no global store at $PNPM_GLOBAL_HOME"
+    return 0
+  fi
+  # Resolve pnpm before touching PATH: the global bin directory holds a stale
+  # pnpm shim that would otherwise win the lookup and fail to exec.
+  local pnpm_bin
+  pnpm_bin="$(command -v pnpm)" || return 1
+
+  PNPM_HOME="$PNPM_GLOBAL_HOME" PATH="$PNPM_GLOBAL_HOME/bin:$PATH" \
+    "$pnpm_bin" update -g --latest
+}
+
+# --- runtimes ----------------------------------------------------------------
+
+update_runtimes() {
+  warn "mise installs each runtime in its own directory; npm globals do not"
+  warn "carry across Node versions. Reinstall your global CLIs afterwards."
+  mise upgrade --yes
+}
+
+# --- health ------------------------------------------------------------------
+
+# Gentle Shell ships under two sources (npm:gentle-pi and the gentle-shell git
+# repo). A Pi home that declares both, or the same package twice, fails to load
+# every duplicated tool. Report it; never edit a Pi settings.json silently.
+check_pi_homes() {
+  command -v jq >/dev/null 2>&1 || return 0
+  local home file dupes
+  for home in "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" "${GENTLE_SHELL_HOME:-$HOME/.gentle-shell/agent}"; do
+    file="$home/settings.json"
+    [ -f "$file" ] || continue
+    dupes="$(jq -r '
+      [.packages[]? | if type == "object" then .source else . end
+        | sub("^npm:gentle-pi(@.*)?$"; "gentle-shell")
+        | sub("^git:.*/gentle-shell(@.*)?$"; "gentle-shell")
+        | sub("^(?<n>npm:@?[^@]+)@.*$"; "\(.n)")]
+      | group_by(.) | map(select(length > 1) | .[0]) | join(", ")' "$file" 2>/dev/null)"
+    if [ -n "$dupes" ]; then
+      FAILED+=("Pi home $home declares duplicate packages: $dupes (edit $file)")
+      warn "Pi home $home declares duplicate packages: $dupes"
+    fi
+  done
+}
+
+# --- main --------------------------------------------------------------------
+
+case "$TARGET" in
+  all|agents|toolchain|plugins|packages|runtimes) ;;
+  *)
+    printf 'usage: gentle-update [all|agents|toolchain|plugins|packages|runtimes]\n' >&2
+    exit 2
+    ;;
+esac
+
+wants() { [ "$TARGET" = all ] || [ "$TARGET" = "$1" ]; }
+
+mkdir -p "$BIN_DIR"
+
+bold "Before"
+report_versions
+
+if wants agents || wants toolchain || wants packages; then
+  heading "Gentle Shell standalone launcher"
+  step "Gentle Shell launcher (npm:${GENTLE_SHELL_NPM_PACKAGE})" npm install_gentle_shell
+fi
+
+if wants agents || wants toolchain; then
+  heading "Gentle Shell isolated home"
+  if wants agents; then
+    # --all also refreshes the packages the plain `pi` home declares, so it
+    # never lags behind the isolated Gentle Shell home.
+    step "PATH Pi runtime + extensions" pi pi update --all
+  fi
+  step "Gentle Shell setup" gentle-shell gentle-shell --isolated setup
+fi
+
+if wants agents; then
+  heading "AI agents (latest stable)"
+  step "Claude Code" claude   claude update
+  step "Codex"       codex    codex update
+  step "OpenCode"    opencode opencode upgrade
+  step "Gentle Shell extensions" gentle-shell gentle-shell --isolated update --extensions
+  update_herdr
+fi
+
+if wants toolchain; then
+  heading "Gentleman toolchain (tip of main)"
+  step "gentle-ai" go install_from_main gentle-ai "$GENTLE_AI_PKG"
+  step "engram"    go install_from_main engram    "$ENGRAM_PKG"
+  sync_gentle_ai_dev_override
+fi
+
+if wants plugins; then
+  heading "Claude Code plugins"
+  step "Claude Code plugins" claude update_claude_plugins
+fi
+
+if wants packages; then
+  heading "Global packages"
+  step "npm globals"  npm   update_npm_globals
+  step "pnpm globals" pnpm  update_pnpm_globals
+  step "moshi-hook"   moshi-hook moshi-hook update
+  step "mise"         mise  mise self-update --yes
+fi
+
+# Opt-in only: never reached by `all`.
+if [ "$TARGET" = runtimes ]; then
+  heading "Language runtimes (mise)"
+  step "mise runtimes" mise update_runtimes
+fi
+
+hash -r 2>/dev/null || true
+
+check_pi_homes
+
+bold "After"
+report_versions
+
+if [ ${#SKIPPED[@]} -gt 0 ]; then
+  bold "Skipped"
+  printf '  • %s\n' "${SKIPPED[@]}"
+fi
+
+if [ ${#FAILED[@]} -gt 0 ]; then
+  bold "Failed"
+  printf '  • %s\n' "${FAILED[@]}"
+  printf '\nRestart your agents once the failures above are resolved.\n'
+  exit 1
+fi
+
+bold "Done — restart Claude Code, Gentle Shell, and any open agent to load the new builds."
