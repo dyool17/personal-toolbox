@@ -48,6 +48,10 @@
 #   --yes      Do not ask for confirmation. Required without a terminal.
 #   --dry-run  Print the plan and every command without changing anything.
 #
+# Exit status of `restore`: 0 every planned component was restored, 1 a
+# component failed (or the restore was refused), 2 usage error, 3 nothing
+# differed from the snapshot, so nothing was restored and nothing is held.
+#
 # A restore first snapshots the current state, so a rollback is itself
 # reversible. Each component is isolated: a failure is reported at the end and
 # never stops the remaining components.
@@ -56,7 +60,8 @@ set -uo pipefail
 
 STATE="${GENTLE_UPDATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gentle-update}"
 BIN_DIR="${GENTLE_UPDATE_BIN_DIR:-$HOME/.local/bin}"
-KEEP="${GENTLE_UPDATE_KEEP_SNAPSHOTS:-7}"
+# Validated in main: anything but a positive integer falls back to 7.
+KEEP="${GENTLE_UPDATE_KEEP_SNAPSHOTS-7}"
 PI_HOME="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
 GENTLE_SHELL_HOME_DIR="${GENTLE_SHELL_HOME:-$HOME/.gentle-shell/agent}"
 PLUGINS_FILE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
@@ -101,7 +106,19 @@ usage:
   gentle-rollback holds                        list held components
   gentle-rollback hold <component> [reason]
   gentle-rollback unhold <component|all>
+
+restore exits 0 when it restored, 1 on failure, 3 when nothing differed.
 EOF
+}
+
+# Every command below depends on these; a missing one must stop the run here
+# rather than be read later as "no difference" or "not referenced".
+require_tools() {
+  local tool missing=()
+  for tool in "$@"; do
+    command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
+  done
+  [ ${#missing[@]} -eq 0 ] || die "missing required tool(s): ${missing[*]}"
 }
 
 # Perform one mutation, or describe it under --dry-run. The lock descriptor is
@@ -133,7 +150,7 @@ sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
 # "2.1.289 (Claude Code)" -> "2.1.289". Fails when the line holds no version.
 version_number() {
   local n
-  n="$(printf '%s\n' "$1" | rg -o '[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.]+)?' | head -1)"
+  n="$(printf '%s\n' "$1" | grep -oE '[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.]+)?' | head -1)"
   [ -n "$n" ] || return 1
   printf '%s\n' "$n"
 }
@@ -380,24 +397,58 @@ snapshot_ids() {
 }
 
 # Drop the oldest snapshots beyond the retention count, then every stored
-# binary that no remaining snapshot references.
+# binary that no remaining snapshot references. <keep_id> is the snapshot that
+# was just created; it is never pruned, whatever the retention count says.
+#
+# Deleting a blob is irreversible, so this fails closed: the set of referenced
+# hashes is built first, with shell builtins only, and nothing is deleted
+# unless every remaining snapshot could be read. "Could not tell" must never
+# be treated as "not referenced".
 prune() {
-  local ids=() id sha referenced blob excess
+  local keep_id="${1:-}" ids=() id name sha blob excess file
+  local -A referenced=()
   mapfile -t ids < <(snapshot_ids)
   excess=$(( ${#ids[@]} - KEEP ))
   for id in "${ids[@]}"; do
     [ "$excess" -gt 0 ] || break
     excess=$((excess - 1))
-    [ "$id" = "$PROTECT_ID" ] && continue
-    rm -rf "${STATE:?}/snapshots/$id"
+    if [ "$id" = "$PROTECT_ID" ] || [ "$id" = "$keep_id" ]; then continue; fi
+    rm -rf "${STATE:?}/snapshots/$id" || return 1
   done
 
-  referenced="$(cat "$STATE"/snapshots/[0-9]*/binaries.tsv 2>/dev/null | cut -f2)"
+  mapfile -t ids < <(snapshot_ids)
+  for id in "${ids[@]}"; do
+    file="$STATE/snapshots/$id/binaries.tsv"
+    if [ ! -r "$file" ]; then
+      warn "snapshot $id has no readable binaries.tsv; no stored binary was removed"
+      return 1
+    fi
+    while IFS=$'\t' read -r name sha; do
+      if [ -z "$name" ] && [ -z "$sha" ]; then continue; fi
+      if [[ ! "$sha" =~ ^[0-9a-f]{64}$ ]]; then
+        warn "snapshot $id has a malformed binaries.tsv; no stored binary was removed"
+        return 1
+      fi
+      referenced["$sha"]=1
+    done < "$file"
+  done
+
   for blob in "$STATE"/store/*; do
     [ -f "$blob" ] || continue
-    sha="$(basename "$blob")"
-    rg -qxF -- "$sha" <<<"$referenced" || rm -f "$blob"
+    sha="${blob##*/}"
+    if [ -z "${referenced[$sha]:-}" ]; then
+      rm -f "$blob" || return 1
+    fi
   done
+}
+
+# Every binary a snapshot lists must be present in the store.
+snapshot_blobs_present() {
+  local name sha
+  while IFS=$'\t' read -r name sha; do
+    [ -n "$sha" ] || continue
+    [ -f "$STATE/store/$sha" ] || { warn "stored binary for $name ($sha) is missing"; return 1; }
+  done < "$STATE/snapshots/$1/binaries.tsv"
 }
 
 # Create a snapshot and print its id on stdout (and nothing else there).
@@ -432,7 +483,10 @@ take_snapshot() {
   fi
   mv "$tmp" "$STATE/snapshots/$id" || { rm -rf "$tmp"; return 1; }
 
-  prune
+  # A snapshot that cannot be restored from is not a snapshot: report failure
+  # (and print no id) when pruning went wrong or took one of its binaries.
+  prune "$id" || return 1
+  snapshot_blobs_present "$id" || return 1
   printf '%s\n' "$id"
 }
 
@@ -466,10 +520,16 @@ restore_binary() {
 
 # The hooks written into each agent belong to the moshi-hook build that wrote
 # them, and the daemon keeps running the old binary until it is restarted.
+#
+# The Pi hook is reinstalled only in a home whose snapshot contains it. A
+# restore puts things back; it must never wire Moshi into a home that did not
+# have it when the snapshot was taken.
 restore_moshi_hook() {
-  local home status=0
+  local comp home status=0
   restore_binary moshi-hook || return 1
-  for home in "$PI_HOME" "$GENTLE_SHELL_HOME_DIR"; do
+  for comp in pi gentle-shell; do
+    [ -f "$SNAP/homes/$comp/extensions/moshi-hooks.ts" ] || continue
+    home="$(home_of "$comp")"
     [ -d "$home" ] || continue
     run env PI_CODING_AGENT_DIR="$home" moshi-hook install --target pi || status=1
   done
@@ -518,7 +578,7 @@ restore_pi_home() {
     run mkdir -p "$home" && run cp -a "$SNAP/homes/$comp/." "$home/" || status=1
     # The extensions under <home>/npm/node_modules follow the lockfile, so a
     # restored lockfile needs a clean install to take effect.
-    if rg -qxF 'npm/package-lock.json' <<<"$changed"; then
+    if grep -qxF 'npm/package-lock.json' <<<"$changed"; then
       run npm ci --prefix "$home/npm" || status=1
     fi
   fi
@@ -617,7 +677,11 @@ cmd_restore() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --only)
-        [ $# -ge 2 ] || die "--only needs a value" 2
+        # An empty value (for example from an unset variable) must not fall
+        # through to "restore every component".
+        if [ $# -lt 2 ] || [ -z "$2" ]; then
+          die "--only needs at least one component (one of: ${COMPONENTS[*]})" 2
+        fi
         only="$2"; shift 2 ;;
       --yes)     yes=1; shift ;;
       --dry-run) DRY_RUN=1; shift ;;
@@ -628,6 +692,7 @@ cmd_restore() {
 
   if [ -n "$only" ]; then
     IFS=, read -ra wanted <<<"$only"
+    [ ${#wanted[@]} -gt 0 ] || die "--only needs at least one component (one of: ${COMPONENTS[*]})" 2
     for comp in "${wanted[@]}"; do require_component "$comp"; done
   fi
 
@@ -641,7 +706,8 @@ cmd_restore() {
   done
   if [ ${#plan[@]} -eq 0 ]; then
     ok "Nothing to restore: the selected components match snapshot $SNAP_ID."
-    return 0
+    # Distinct from 0 so a caller can tell "restored" from "nothing differed".
+    exit 3
   fi
 
   bold "Restore from snapshot $SNAP_ID — $(head -1 "$SNAP/reason" 2>/dev/null)"
@@ -745,6 +811,13 @@ cmd_unhold() {
 # root would leave root-owned files in the user's tool directories.
 if [ "${EUID:-$(id -u)}" -eq 0 ]; then
   die "refusing to run as root; run gentle-rollback as your own user"
+fi
+
+require_tools jq flock sha256sum timeout
+
+if [[ ! "$KEEP" =~ ^[1-9][0-9]*$ ]]; then
+  warn "GENTLE_UPDATE_KEEP_SNAPSHOTS='$KEEP' is not a positive integer; keeping 7 snapshots"
+  KEEP=7
 fi
 
 # The tracked binaries live in BIN_DIR; make sure those are the ones measured

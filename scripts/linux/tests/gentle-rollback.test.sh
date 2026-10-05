@@ -62,6 +62,15 @@ cat > "$SANDBOX/stub" <<'EOF'
 #!/usr/bin/env bash
 name="$(basename "$0")"
 printf '%s %s\n' "$name" "$*" >> "$STUB_LOG"
+if [ "$name" = pnpm ]; then
+  # Record what pnpm needs for global commands: PNPM_HOME and its bin
+  # directory on PATH.
+  case ":$PATH:" in
+    *":${PNPM_HOME:-unset}/bin:"*) on_path=yes ;;
+    *)                             on_path=no ;;
+  esac
+  printf 'pnpm-env home=%s bin-on-path=%s\n' "${PNPM_HOME:-unset}" "$on_path" >> "$STUB_LOG"
+fi
 case "$name $*" in
   "npm ls -g --depth=0 --json")  cat "$SANDBOX/npm-globals.json" ;;
   "pnpm ls -g --depth=0 --json") cat "$SANDBOX/pnpm-globals.json" ;;
@@ -110,6 +119,7 @@ write_binary() {
 # fake $1 build $2
 if [ "\${1:-}" = --version ]; then echo "$1 $2.0.0"; exit 0; fi
 printf '%s %s\n' "$1" "\$*" >> "\$STUB_LOG"
+if [ "\${1:-}" = install ]; then printf 'install-home %s\n' "\${PI_CODING_AGENT_DIR:-}" >> "\$STUB_LOG"; fi
 EOF
   chmod 755 "$GENTLE_UPDATE_BIN_DIR/$1"
 }
@@ -161,7 +171,8 @@ check_eq "binaries.tsv lists the four binaries" "4" "$(wc -l < "$SNAP1/binaries.
 check "store holds the herdr blob" cmp -s "$GENTLE_UPDATE_BIN_DIR/herdr" "$GENTLE_UPDATE_STATE_DIR/store/$(sha "$GENTLE_UPDATE_BIN_DIR/herdr")"
 check "npm-globals.json is saved" jq -e '.dependencies["left-pad"].version == "1.0.0"' "$SNAP1/npm-globals.json"
 check "pnpm-globals.json is saved" jq -e '.[0].dependencies["@scope/tool"].version == "0.15.1"' "$SNAP1/pnpm-globals.json"
-check "pnpm ran with its global bin dir on PATH" grep -qx 'pnpm ls -g --depth=0 --json' "$STUB_LOG"
+check "pnpm globals are listed" grep -qx 'pnpm ls -g --depth=0 --json' "$STUB_LOG"
+check "pnpm ran with PNPM_HOME set and its global bin dir on PATH" grep -qxF "pnpm-env home=$PNPM_HOME bin-on-path=yes" "$STUB_LOG"
 check "pi home settings.json is saved" cmp -s "$PI_CODING_AGENT_DIR/settings.json" "$SNAP1/homes/pi/settings.json"
 check "pi home extensions are saved" test -f "$SNAP1/homes/pi/extensions/demo/index.ts"
 check "gentle-shell home lockfile is saved" test -f "$SNAP1/homes/gentle-shell/npm/package-lock.json"
@@ -226,14 +237,26 @@ rb unhold all >/dev/null 2>&1
 check_eq "unhold all removes every hold" "0" "$(find "$GENTLE_UPDATE_STATE_DIR/holds" -type f 2>/dev/null | wc -l)"
 
 rb restore "$IDB" --only engram --yes >/dev/null 2>&1
-check_eq "nothing left to restore exits 0" "0" "$(rb restore "$IDB" --yes >/dev/null 2>&1; echo $?)"
+check_eq "nothing left to restore exits 3, distinct from restored" "3" "$(rb restore "$IDB" --yes >/dev/null 2>&1; echo $?)"
+
+# An empty --only (for example from an unset variable) must not mean "all".
+write_binary herdr 2
+rb restore "$IDB" --only "" --yes >/dev/null 2>&1
+check_eq "an empty --only exits 2" "2" "$?"
+check_eq "an empty --only restores nothing" "herdr 2.0.0" "$("$GENTLE_UPDATE_BIN_DIR/herdr" --version)"
+write_binary herdr 1
 
 # moshi-hook: binary, then hooks for every Pi home, then the daemon.
+# Only the standard Pi home has Moshi hooks; the Gentle Shell home exists but
+# never had them, and a restore must not wire Moshi into it.
 fresh_state moshi
+echo 'moshi hooks' > "$PI_CODING_AGENT_DIR/extensions/moshi-hooks.ts"
 rb snapshot >/dev/null 2>&1
 write_binary moshi-hook 2
 rb restore latest --only moshi-hook --yes >/dev/null 2>&1
-check_eq "moshi-hook restore reinstalls Pi hooks for both homes" "2" "$(grep -cx 'moshi-hook install --target pi' "$STUB_LOG")"
+check_eq "moshi-hook restore reinstalls Pi hooks once" "1" "$(grep -cx 'moshi-hook install --target pi' "$STUB_LOG")"
+check "the Pi hook goes into the home whose snapshot had it" grep -qxF "install-home $PI_CODING_AGENT_DIR" "$STUB_LOG"
+check_not "the Pi hook is not installed into a home that never had it" grep -qxF "install-home $GENTLE_SHELL_HOME" "$STUB_LOG"
 check "moshi-hook restore restarts the daemon" grep -qx 'moshi-hook service restart' "$STUB_LOG"
 write_binary moshi-hook 1
 
@@ -336,6 +359,54 @@ WANTED="$(sha "$GENTLE_UPDATE_BIN_DIR/gentle-ai")"
 write_binary gentle-ai 3
 rb restore "$OLDEST" --only gentle-ai --yes >/dev/null 2>&1
 check_eq "retention never prunes the snapshot being restored" "$WANTED" "$(sha "$GENTLE_UPDATE_BIN_DIR/gentle-ai")"
+
+# --- retention value ---------------------------------------------------------
+
+for bad in 0 abc ""; do
+  fresh_state "keep-${bad:-empty}"
+  export GENTLE_UPDATE_KEEP_SNAPSHOTS="$bad"
+  ERR="$(rb snapshot 2>&1 >"$SANDBOX/keep-id")"
+  IDK="$(cat "$SANDBOX/keep-id")"
+  check "KEEP='$bad' keeps the snapshot it just created" test -n "$IDK" -a -d "$GENTLE_UPDATE_STATE_DIR/snapshots/$IDK"
+  check "KEEP='$bad' warns and falls back to 7" grep -q 'GENTLE_UPDATE_KEEP_SNAPSHOTS' <<<"$ERR"
+done
+export GENTLE_UPDATE_KEEP_SNAPSHOTS=7
+
+# --- pruning fails closed ----------------------------------------------------
+
+# A broken ripgrep must not turn "cannot tell" into "unreferenced".
+fresh_state no-rg
+printf '#!/usr/bin/env bash\nexit 127\n' > "$STUBS/rg"
+chmod 755 "$STUBS/rg"
+IDR="$(rb snapshot 2>/dev/null)"
+check_eq "a broken rg does not wipe the store" "4" "$(blob_count)"
+check "the snapshot still succeeds without rg" test -n "$IDR"
+rm -f "$STUBS/rg"
+
+# A snapshot whose binaries.tsv is gone makes the reference set unknowable.
+fresh_state corrupt
+rb snapshot >/dev/null 2>&1
+mkdir -p "$GENTLE_UPDATE_STATE_DIR/snapshots/20000101-000000"
+OUT="$(rb snapshot 2>/dev/null)"
+check_eq "snapshot fails when the referenced blobs cannot be determined" "1" "$?"
+check_eq "a failed snapshot prints no id" "" "$OUT"
+check_eq "no blob is deleted when pruning fails" "4" "$(blob_count)"
+
+# --- dependency preflight ----------------------------------------------------
+
+# A PATH with every system tool except the one under test.
+SYS="$SANDBOX/sys"
+mkdir -p "$SYS"
+ln -s /usr/bin/* "$SYS/" 2>/dev/null
+for missing in jq flock sha256sum timeout; do
+  fresh_state "missing-$missing"
+  mv "$SYS/$missing" "$SANDBOX/hidden-tool"
+  ERR="$(PATH="$STUBS:$SYS" "$ROLLBACK" snapshot 2>&1 >/dev/null)"
+  check_eq "missing $missing exits 1" "1" "$?"
+  check "missing $missing is named" grep -qw -- "$missing" <<<"$ERR"
+  check_eq "missing $missing creates no snapshot" "0" "$(snapshot_count)"
+  mv "$SANDBOX/hidden-tool" "$SYS/$missing"
+done
 
 printf '\n'
 if [ "$FAILS" -gt 0 ]; then

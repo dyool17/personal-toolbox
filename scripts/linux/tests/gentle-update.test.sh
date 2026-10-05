@@ -64,6 +64,12 @@ if [ "${1:-}" = snapshot ]; then
   [ -e "$SANDBOX/fail-snapshot" ] && exit 1
   echo "20260101-000000"
 fi
+if [ "${1:-}" = restore ]; then
+  # restore-rc selects the outcome: 0 restored, 3 nothing differed, 1 failed.
+  rc="$(cat "$SANDBOX/restore-rc" 2>/dev/null || echo 0)"
+  if [ "$rc" = 0 ] && [ ! -e "$SANDBOX/restore-does-not-fix" ]; then rm -f "$SANDBOX/claude-broken"; fi
+  exit "$rc"
+fi
 exit 0
 EOF
 chmod 755 "$APP/gentle-rollback"
@@ -74,7 +80,14 @@ cat > "$SANDBOX/stub" <<'EOF'
 name="$(basename "$0")"
 printf '%s %s\n' "$name" "$*" >> "$STUB_LOG"
 case "$name $*" in
-  "npm ls -g --depth=0 --json") cat "$SANDBOX/npm-globals.json" ;;
+  "npm ls -g --depth=0 --json")
+    [ -e "$SANDBOX/fail-npm-ls" ] && exit 1
+    cat "$SANDBOX/npm-globals.json"
+    ;;
+  "mise env -s bash")
+    if [ -e "$SANDBOX/fail-mise-env" ]; then echo "mise: config error" >&2; exit 1; fi
+    if [ ! -e "$SANDBOX/empty-mise-env" ]; then echo "export GENTLE_TEST_MISE_ENV=1"; fi
+    ;;
   "claude plugin list")         echo "demo@market" ;;
   "claude update")              if [ -e "$SANDBOX/break-claude" ]; then touch "$SANDBOX/claude-broken"; fi ;;
   "claude --version")           [ -e "$SANDBOX/claude-broken" ] && exit 1; echo "2.1.289 (Claude Code)" ;;
@@ -103,14 +116,16 @@ install_bin_dir() {
 install_bin_dir
 export PATH="$STUBS:/usr/bin:/bin"
 
-cat > "$SANDBOX/npm-globals.json" <<'EOF'
+write_npm_globals() {
+  cat > "$SANDBOX/npm-globals.json" <<'JSON'
 {"name": "lib", "dependencies": {
   "@earendil-works/pi-coding-agent": {"version": "1.0.3"},
   "gentle-pi": {"version": "4.0.0"},
   "@openai/codex": {"version": "0.160.0"},
   "left-pad": {"version": "1.0.0"}
 }}
-EOF
+JSON
+}
 
 DOCTOR_OK='{"features": [{"id": "inbox", "status": "ok", "readyAgents": ["claude", "pi"]}, {"id": "sessions", "status": "ok", "readyAgents": null}]}'
 DOCTOR_REGRESSED='{"features": [{"id": "inbox", "status": "ok", "readyAgents": ["claude", "pi"]}, {"id": "sessions", "status": "error", "readyAgents": null}]}'
@@ -120,7 +135,10 @@ RC=0
 # Reset the per-run switches, run gentle-update, and keep its output and status.
 reset() {
   rm -f "$SANDBOX/fail-snapshot" "$SANDBOX/break-claude" "$SANDBOX/claude-broken" \
-    "$SANDBOX/moshi-new-build" "$SANDBOX/doctor-after.json" "$GENTLE_UPDATE_STATE_DIR"/holds/*
+    "$SANDBOX/moshi-new-build" "$SANDBOX/doctor-after.json" "$GENTLE_UPDATE_STATE_DIR"/holds/* \
+    "$SANDBOX/restore-rc" "$SANDBOX/restore-does-not-fix" "$SANDBOX/fail-npm-ls" \
+    "$SANDBOX/fail-mise-env" "$SANDBOX/empty-mise-env"
+  write_npm_globals
   printf '%s\n' "$DOCTOR_OK" > "$SANDBOX/doctor.json"
   install_bin_dir
   : > "$STUB_LOG"
@@ -234,6 +252,92 @@ check_eq "a tool that broke fails the run" "1" "$RC"
 check "the broken tool is rolled back to the pre-update snapshot" logged "gentle-rollback restore 20260101-000000 --only claude --yes"
 check "the rollback is reported" grep -qF 'claude broke after the update; rolled back and held' <<<"$OUT"
 check_eq "only the broken tool is rolled back" "1" "$(grep -c '^gentle-rollback restore' "$STUB_LOG")"
+
+reset
+touch "$SANDBOX/break-claude"
+GENTLE_UPDATE_NO_SNAPSHOT=1 run_update agents
+check_eq "a broken tool without a snapshot fails the run" "1" "$RC"
+check "no snapshot: the tool is reported as not rolled back" grep -qF 'claude broke after the update; not rolled back (no snapshot)' <<<"$OUT"
+check_not "no snapshot: no restore is attempted" grep -q '^gentle-rollback restore' "$STUB_LOG"
+
+reset
+touch "$SANDBOX/break-claude"
+echo 3 > "$SANDBOX/restore-rc"
+run_update agents
+check "nothing differed: no rollback is claimed" grep -qF 'claude stopped working but its recorded state is unchanged; held, needs manual attention' <<<"$OUT"
+check_not "nothing differed: 'rolled back' is not reported" grep -qF 'rolled back and held' <<<"$OUT"
+check "nothing differed: the component is held" grep -q '^gentle-rollback hold claude ' "$STUB_LOG"
+
+reset
+touch "$SANDBOX/break-claude"
+echo 1 > "$SANDBOX/restore-rc"
+run_update agents
+check "restore failed: reported as rollback failed" grep -qF 'claude broke after the update; rollback failed' <<<"$OUT"
+check "restore failed: the component is still held" grep -q '^gentle-rollback hold claude ' "$STUB_LOG"
+
+reset
+touch "$SANDBOX/break-claude" "$SANDBOX/restore-does-not-fix"
+run_update agents
+check "a restore that leaves the tool broken is not reported as a rollback" grep -qF 'claude broke after the update; rollback failed' <<<"$OUT"
+check_not "a restore that leaves the tool broken does not claim success" grep -qF 'rolled back and held' <<<"$OUT"
+
+# --- mise bootstrap ----------------------------------------------------------
+
+reset
+touch "$SANDBOX/fail-mise-env"
+run_update all
+check_eq "a failing mise environment aborts with exit 1" "1" "$RC"
+check "the mise error output is shown" grep -q 'mise: config error' <<<"$OUT"
+check_not "a failing mise environment takes no snapshot" grep -q '^gentle-rollback' "$STUB_LOG"
+check_not "a failing mise environment updates nothing" grep -qE -- "$UPDATE_COMMANDS" "$STUB_LOG"
+
+reset
+touch "$SANDBOX/empty-mise-env"
+run_update all
+check_eq "an empty mise environment aborts with exit 1" "1" "$RC"
+check_not "an empty mise environment takes no snapshot" grep -q '^gentle-rollback' "$STUB_LOG"
+
+reset
+touch "$SANDBOX/fail-mise-env"
+MISE_SHELL=bash run_update agents
+check_eq "a mise-activated shell does not need the bootstrap" "0" "$RC"
+
+# --- npm listing -------------------------------------------------------------
+
+reset
+touch "$SANDBOX/fail-npm-ls"
+run_update packages
+check_eq "a failing npm listing fails the run" "1" "$RC"
+check "a failing npm listing is listed under Failed" grep -q 'npm globals' <<<"$(sed -n '/Failed/,$p' <<<"$OUT")"
+check_not "a failing npm listing updates no npm package" grep -q '^npm update' "$STUB_LOG"
+
+reset
+echo 'not json' > "$SANDBOX/npm-globals.json"
+run_update packages
+check_eq "an unparseable npm listing fails the run" "1" "$RC"
+
+reset
+echo '{"name": "lib"}' > "$SANDBOX/npm-globals.json"
+run_update packages
+check_eq "an empty but valid npm listing is a success" "0" "$RC"
+check_not "an empty npm listing updates nothing" grep -q '^npm update' "$STUB_LOG"
+
+# --- dependency preflight ----------------------------------------------------
+
+# A PATH with every system tool except the one under test.
+SYS="$SANDBOX/sys"
+mkdir -p "$SYS"
+ln -s /usr/bin/* "$SYS/" 2>/dev/null
+for missing in jq flock sha256sum timeout rg; do
+  reset
+  mv "$SYS/$missing" "$SANDBOX/hidden-tool"
+  OUT="$(PATH="$STUBS:$SYS" "$APP/gentle-update" all 2>&1 </dev/null)"
+  check_eq "missing $missing exits 1" "1" "$?"
+  check "missing $missing is named" grep -qw -- "$missing" <<<"$OUT"
+  check_not "missing $missing takes no snapshot" grep -q '^gentle-rollback' "$STUB_LOG"
+  check_not "missing $missing updates nothing" grep -qE -- "$UPDATE_COMMANDS" "$STUB_LOG"
+  mv "$SANDBOX/hidden-tool" "$SYS/$missing"
+done
 
 printf '\n'
 if [ "$FAILS" -gt 0 ]; then

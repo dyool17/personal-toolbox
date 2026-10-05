@@ -33,7 +33,8 @@
 #     rolled back is not reinstalled the next day.
 #   - After the updates every tool that answered `--version` before must still
 #     answer. One that does not is rolled back to the pre-update snapshot and
-#     held, and the run is reported as failed.
+#     held, and the run is reported as failed. When it cannot be rolled back it
+#     is held anyway and reported for what happened.
 #
 # Usage:
 #   gentle-update [all|agents|toolchain|plugins|packages|runtimes]
@@ -245,10 +246,19 @@ npm_component() {
 # so the packages are named one by one and the held ones are left out.
 update_npm_globals() {
   local listing names pkg pkgs=()
-  # npm can exit non-zero and still print a usable list (for example with an
-  # extraneous package), so only the output decides.
-  listing="$(npm ls -g --depth=0 --json 2>/dev/null)"
-  names="$(jq -r '.dependencies // {} | keys[]' <<<"$listing" 2>/dev/null)" || return 1
+  # A listing that failed or does not parse is not an empty listing: fail the
+  # step instead of reporting that there was nothing to update. npm's own
+  # error output is left on stderr.
+  if ! listing="$(npm ls -g --depth=0 --json)"; then
+    warn "npm ls -g failed; npm globals were not updated"
+    return 1
+  fi
+  # jq alone would accept empty output as "no packages", so require an object.
+  if [ -z "$listing" ] || ! names="$(jq -r 'if type == "object" then (.dependencies // {} | keys[])
+      else error("not a package listing") end' <<<"$listing" 2>/dev/null)"; then
+    warn "npm ls -g printed no usable package list; npm globals were not updated"
+    return 1
+  fi
 
   while read -r pkg; do
     [ -n "$pkg" ] || continue
@@ -400,20 +410,47 @@ dedupe_gentle_shell_home() {
   rm -f "$tmp"
 }
 
+answers_version() { timeout 20 "$1" --version >/dev/null 2>&1 </dev/null; }
+
+# Hold a component that could not be put back, so the next daily run does not
+# reinstall the same broken release (possibly through the broken tool itself).
+hold_broken() {
+  "$ROLLBACK" hold "$1" "$2" 9>&- >/dev/null \
+    || warn "$1 could not be held; the next run will try to update it again"
+}
+
 # A tool that answered `--version` before the run and no longer does was broken
 # by this run. Put it back from the pre-update snapshot; gentle-rollback holds
 # it, so tomorrow's run does not install the same broken release again.
+#
+# Each outcome is reported for what it is. "Rolled back" is only claimed when
+# gentle-rollback restored something (exit 0, not 3 = nothing differed) and
+# the tool answers again afterwards.
 smoke_check() {
-  local tool
+  local tool status
   for tool in "${WORKED_BEFORE[@]}"; do
-    timeout 20 "$tool" --version >/dev/null 2>&1 </dev/null && continue
+    answers_version "$tool" && continue
     warn "$tool no longer runs after the update"
+
+    if [ -z "$SNAPSHOT_ID" ]; then
+      FAILED+=("$tool broke after the update; not rolled back (no snapshot)")
+      continue
+    fi
+
     # The snapshot is named by id: after the first restore `latest` would be
     # that restore's own pre-rollback snapshot, which holds the broken state.
-    if [ -n "$SNAPSHOT_ID" ] \
-      && "$ROLLBACK" restore "$SNAPSHOT_ID" --only "$tool" --yes 9>&-; then
+    "$ROLLBACK" restore "$SNAPSHOT_ID" --only "$tool" --yes 9>&-
+    status=$?
+    hash -r 2>/dev/null || true
+
+    if [ "$status" -eq 3 ]; then
+      hold_broken "$tool" "stopped working after an update; recorded state unchanged"
+      FAILED+=("$tool stopped working but its recorded state is unchanged; held, needs manual attention")
+    elif [ "$status" -eq 0 ] && answers_version "$tool"; then
       FAILED+=("$tool broke after the update; rolled back and held")
     else
+      # Includes mise, claude and opencode, whose restore runs the broken tool.
+      hold_broken "$tool" "broke after an update; rollback to $SNAPSHOT_ID failed"
       FAILED+=("$tool broke after the update; rollback failed")
     fi
   done
@@ -441,6 +478,15 @@ if [ "${EUID:-$(id -u)}" -eq 0 ]; then
   exit 1
 fi
 
+# Without these the lock, the snapshot, or a step would fail in a way that
+# reads as "busy" or "nothing to do", so check them before doing anything.
+for tool in jq flock sha256sum timeout rg; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    printf 'gentle-update: missing required tool: %s; nothing was updated\n' "$tool" >&2
+    exit 1
+  fi
+done
+
 wants() { [ "$TARGET" = all ] || [ "$TARGET" = "$1" ]; }
 
 mkdir -p "$BIN_DIR"
@@ -452,8 +498,16 @@ mkdir -p "$BIN_DIR"
 if [ -z "${MISE_SHELL:-}" ]; then
   MISE_BIN="$BIN_DIR/mise"
   [ -x "$MISE_BIN" ] || MISE_BIN="$(command -v mise 2>/dev/null || true)"
-  if [ -n "$MISE_BIN" ] && cd "$HOME"; then
-    eval "$("$MISE_BIN" env -s bash 2>/dev/null)"
+  if [ -n "$MISE_BIN" ]; then
+    cd "$HOME" || exit 1
+    # mise's own error output is left on stderr. A failure here must stop the
+    # run: carrying on would skip every step as "not installed" and still
+    # report success.
+    if ! MISE_ENV="$("$MISE_BIN" env -s bash)" || [ -z "$MISE_ENV" ]; then
+      printf 'gentle-update: "%s env -s bash" failed or printed no environment; nothing was updated\n' "$MISE_BIN" >&2
+      exit 1
+    fi
+    eval "$MISE_ENV"
   fi
 fi
 # Locally installed tools win over the copies mise may also provide.
@@ -482,7 +536,7 @@ ROLLBACK="$(dirname "$(readlink -f "$0")")/gentle-rollback"
 [ -x "$ROLLBACK" ] || ROLLBACK="$(command -v gentle-rollback 2>/dev/null || true)"
 
 for tool in "${SMOKE_TOOLS[@]}"; do
-  if timeout 20 "$tool" --version >/dev/null 2>&1 </dev/null; then WORKED_BEFORE+=("$tool"); fi
+  if answers_version "$tool"; then WORKED_BEFORE+=("$tool"); fi
 done
 
 bold "Before"

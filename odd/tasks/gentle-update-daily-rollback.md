@@ -82,6 +82,11 @@ Retention: `GENTLE_UPDATE_KEEP_SNAPSHOTS` (default 7), then unreferenced
 - [x] **T3** systemd service + timer and README section. Route: delegated.
 - [ ] **T4** Install: symlink `gentle-rollback`, link and enable the timer, take
   one real snapshot and read it back. Route: inline (parent, state commands).
+- [x] **T5** Fail closed on the unattended path: blob pruning, dependency
+  preflight, retention value, empty `--only`, Moshi restore invariant, smoke
+  check truthfulness, mise bootstrap, npm listing failure, pnpm test claim.
+  Route: delegated (follow-up from the approved review; its findings were
+  non-blocking).
 
 ## Acceptance criteria
 
@@ -161,3 +166,24 @@ Commits on `feat/gentle-update-daily-rollback` after `acc7451`:
 
 Next step: T4, then the first unattended run is worth reading in the journal,
 since no real `gentle-update` run has exercised the new code yet.
+
+Review: the native review of `acc7451..0cd84b6` was granted, approved and
+acknowledged (lineage `review-cbc5586b681241d8`), assessed tier high.
+
+- **T5** done. Route: delegated (same writer). Commit
+  `fix(scripts): fail closed in gentle-update unattended paths` (the commit
+  that adds this entry; see `git log 0cd84b6..`).
+  - RED (new cases against the T1-T3 scripts): rollback test exit 1, 20 FAIL /
+    87 ok; update test exit 1, 28 FAIL / 58 ok.
+  - GREEN: rollback test exit 0, 107 ok; update test exit 0, 86 ok.
+  - `shellcheck` on both scripts and both tests: clean.
+  - Real machine, scratch state dir: `snapshot --reason verify` printed an id,
+    `show latest` listed all 13 components as `same`.
+  - `gentle-rollback restore` now exits 3 when nothing differed (was 0).
+  - gentle-rollback no longer uses `rg`; gentle-update still does and checks it.
+  - `npm ls -g` exiting non-zero now fails the npm step even when it printed a
+    list (it exits 0 on this machine today). An extraneous global package
+    would therefore fail the step until it is cleaned up.
+  - Not changed (out of the stated scope): `gentle-update` itself still
+    reinstalls the Pi Moshi hook in every existing Pi home when `pi` was a
+    ready agent; only the restore path was restricted to homes that had it.
