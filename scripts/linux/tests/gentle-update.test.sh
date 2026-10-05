@@ -53,6 +53,10 @@ mkdir -p "$APP" "$STUBS" "$GENTLE_UPDATE_BIN_DIR" "$PNPM_HOME/bin" "$SANDBOX/gop
   "$PI_CODING_AGENT_DIR" "$GENTLE_SHELL_HOME" "$GENTLE_UPDATE_STATE_DIR/holds"
 : > "$STUB_LOG"
 
+# Only the standard Pi home has a Moshi hook; the Gentle Shell home never had one.
+mkdir -p "$PI_CODING_AGENT_DIR/extensions"
+: > "$PI_CODING_AGENT_DIR/extensions/moshi-hooks.ts"
+
 cp "$HERE/../gentle-update" "$APP/gentle-update"
 chmod 755 "$APP/gentle-update"
 
@@ -176,7 +180,7 @@ check "pnpm globals are updated without --latest" logged "pnpm update -g"
 check "the Pi model catalog is refreshed" logged "pi update --models"
 check "the Gentle Shell model catalog is refreshed" logged "gentle-shell --isolated update --models"
 check "moshi-hook is updated" logged "moshi-hook update"
-check_eq "Pi hooks are reinstalled for both Pi homes" "2" "$(grep -cxF 'moshi-hook install --target pi' "$STUB_LOG")"
+check_eq "Pi hooks are reinstalled only in the Pi home that had one" "1" "$(grep -cxF 'moshi-hook install --target pi' "$STUB_LOG")"
 check "hooks are reinstalled for the other ready agent" logged "moshi-hook install --target claude"
 check_not "hooks are not installed for agents that had none" grep -q 'install --target opencode' "$STUB_LOG"
 check_not "the Moshi daemon is left alone when the binary did not change" logged "moshi-hook service restart"

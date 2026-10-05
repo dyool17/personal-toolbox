@@ -246,15 +246,18 @@ npm_component() {
 # so the packages are named one by one and the held ones are left out.
 update_npm_globals() {
   local listing names pkg pkgs=()
-  # A listing that failed or does not parse is not an empty listing: fail the
-  # step instead of reporting that there was nothing to update. npm's own
-  # error output is left on stderr.
-  if ! listing="$(npm ls -g --depth=0 --json)"; then
-    warn "npm ls -g failed; npm globals were not updated"
-    return 1
-  fi
-  # jq alone would accept empty output as "no packages", so require an object.
-  if [ -z "$listing" ] || ! names="$(jq -r 'if type == "object" then (.dependencies // {} | keys[])
+  # A listing that does not parse is not an empty listing: fail the step
+  # instead of reporting that there was nothing to update. npm's own error
+  # output is left on stderr.
+  #
+  # The exit status alone is not the test: `npm ls` also exits non-zero for an
+  # extraneous or unmet-peer package while still printing a complete listing,
+  # and that must not fail the step every single day.
+  listing="$(npm ls -g --depth=0 --json)" || warn "npm ls -g exited non-zero; using its listing if it parses"
+  # jq alone would accept empty output as "no packages", so require an object
+  # that is not npm's error report.
+  if [ -z "$listing" ] || ! names="$(jq -r 'if type == "object" and (has("error") | not)
+      then (.dependencies // {} | keys[])
       else error("not a package listing") end' <<<"$listing" 2>/dev/null)"; then
     warn "npm ls -g printed no usable package list; npm globals were not updated"
     return 1
@@ -322,9 +325,10 @@ update_moshi_hook() {
     case "$agent" in
       "") ;;
       pi)
-        # Pi hooks live inside a Pi home, and there are two of them.
+        # Pi hooks live inside a Pi home, and there are two of them. doctor
+        # reports `pi` as one agent, so check each home for its own hook file.
         for home in "${PI_HOMES[@]}"; do
-          [ -d "$home" ] || continue
+          [ -f "$home/extensions/moshi-hooks.ts" ] || continue
           PI_CODING_AGENT_DIR="$home" moshi-hook install --target pi || status=1
         done
         ;;
