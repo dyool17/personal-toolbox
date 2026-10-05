@@ -21,15 +21,32 @@
 # silently orphans every globally installed CLI. Run it when you are ready to
 # reinstall those, not as part of a routine refresh.
 #
+# Safe to run unattended (see systemd/gentle-update.timer):
+#
+#   - It builds its own environment, so it does not need an interactive,
+#     mise-activated shell.
+#   - A lock shared with gentle-rollback keeps two runs from overlapping; a
+#     second run exits 0 without doing anything.
+#   - `gentle-rollback snapshot` runs before the first update. Without a
+#     snapshot nothing is updated, unless GENTLE_UPDATE_NO_SNAPSHOT=1.
+#   - A component held by gentle-rollback is skipped, so a release that was
+#     rolled back is not reinstalled the next day.
+#   - After the updates every tool that answered `--version` before must still
+#     answer. One that does not is rolled back to the pre-update snapshot and
+#     held, and the run is reported as failed.
+#
 # Usage:
 #   gentle-update [all|agents|toolchain|plugins|packages|runtimes]
+#   gentle-update --help
 #
 # Each step is isolated: a failing tool is reported at the end and never stops
-# the remaining tools from updating.
+# the remaining tools from updating. The exit status is 1 when anything failed.
 
 set -uo pipefail
 
 BIN_DIR="${GENTLE_UPDATE_BIN_DIR:-$HOME/.local/bin}"
+# State shared with gentle-rollback: snapshots, holds, and the lock.
+STATE="${GENTLE_UPDATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gentle-update}"
 # Module paths carry the major version and change on every major release:
 # when a new major ships, bump /v4 and /v3 here. `@latest` resolves to the
 # newest tagged release and never to a prerelease or main.
@@ -37,11 +54,20 @@ GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@lates
 ENGRAM_PKG="github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 # The npm package name remains gentle-pi; it installs the gentle-shell command.
 GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
+PI_NPM_PACKAGE="@earendil-works/pi-coding-agent"
+CODEX_NPM_PACKAGE="@openai/codex"
 PNPM_GLOBAL_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
+PI_HOMES=("${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" "${GENTLE_SHELL_HOME:-$HOME/.gentle-shell/agent}")
+# Tools that must still answer `--version` after the run. Each name is also
+# the gentle-rollback component that restores it.
+SMOKE_TOOLS=(claude codex opencode pi gentle-shell herdr gentle-ai engram moshi-hook mise)
 
 TARGET="${1:-all}"
 FAILED=()
 SKIPPED=()
+WORKED_BEFORE=()
+ROLLBACK=""
+SNAPSHOT_ID=""
 
 bold()    { printf '\n\033[1m%s\033[0m\n' "$*"; }
 heading() { printf '\n\033[1;35m── %s ──\033[0m\n' "$*"; }
@@ -53,11 +79,22 @@ skip() {
   warn "$1"
 }
 
-# Run one update step. Records failures instead of aborting the run, and skips
-# cleanly when the tool is not installed on this machine.
+# A component is held when gentle-rollback restored it (or the user asked for
+# it with `gentle-rollback hold`). Updating it again would undo the rollback.
+held() { [ -e "$STATE/holds/$1" ]; }
+
+# Run one update step: step <component> <name> <binary> <command...>.
+# Records failures instead of aborting the run, and skips cleanly when the
+# component is held or the tool is not installed on this machine.
 step() {
+  local key="$1"; shift
   local name="$1"; shift
   local binary="$1"; shift
+
+  if held "$key"; then
+    skip "$name — held by gentle-rollback (gentle-rollback unhold $key)"
+    return 0
+  fi
 
   if ! command -v "$binary" >/dev/null 2>&1; then
     skip "$name — not installed ('$binary' is not on PATH)"
@@ -65,7 +102,9 @@ step() {
   fi
 
   printf '\n\033[1m%s\033[0m\n' "$name"
-  if "$@"; then
+  # The lock descriptor is closed for the step: a daemon started by an updater
+  # would otherwise inherit it and keep every later run locked out.
+  if "$@" 9>&-; then
     ok "$name"
   else
     FAILED+=("$name")
@@ -87,18 +126,16 @@ report_versions() {
 
 # --- toolchain ---------------------------------------------------------------
 
-# Build a Go binary from a release into BIN_DIR, keeping one rolling backup.
+# Build a Go binary from a release into BIN_DIR. The previous build is not
+# copied aside here: the pre-update snapshot already holds it, and
+# `gentle-rollback restore --only <name>` brings it back.
 install_release() {
-  local name="$1" pkg="$2" target="$BIN_DIR/$1"
-
-  if [ -f "$target" ]; then
-    cp -a "$target" "$target.prev" || return 1
-  fi
+  local name="$1" pkg="$2"
 
   # A throwaway working directory keeps the build out of any local Go module.
   local workdir
   workdir="$(mktemp -d)" || return 1
-  ( cd "$workdir" && GOBIN="$BIN_DIR" GOFLAGS= go install "$pkg" )
+  ( cd "$workdir" && GOBIN="$BIN_DIR" GOFLAGS='' go install "$pkg" )
   local status=$?
   rm -rf "$workdir"
   [ $status -eq 0 ] || return $status
@@ -151,11 +188,11 @@ update_herdr() {
     skip "herdr — not installed"
     return 0
   fi
-  if [ -n "${HERDR_ENV:-}" ]; then
+  if [ -n "${HERDR_ENV:-}" ] && ! held herdr; then
     skip "herdr — run 'herdr update' from a terminal outside herdr"
     return 0
   fi
-  step "herdr" herdr herdr update
+  step herdr "herdr" herdr herdr update
 }
 
 # --- plugins -----------------------------------------------------------------
@@ -193,13 +230,48 @@ restore_pnpm_bins() {
   done
 }
 
+# Same mapping as gentle-rollback: these packages are components of their own,
+# every other npm global belongs to `npm-globals`.
+npm_component() {
+  case "$1" in
+    "$PI_NPM_PACKAGE")           echo pi ;;
+    "$GENTLE_SHELL_NPM_PACKAGE") echo gentle-shell ;;
+    "$CODEX_NPM_PACKAGE")        echo codex ;;
+    *)                           echo npm-globals ;;
+  esac
+}
+
+# A blanket `npm update -g` would also bump packages whose component is held,
+# so the packages are named one by one and the held ones are left out.
 update_npm_globals() {
-  npm update -g || return 1
+  local listing names pkg pkgs=()
+  # npm can exit non-zero and still print a usable list (for example with an
+  # extraneous package), so only the output decides.
+  listing="$(npm ls -g --depth=0 --json 2>/dev/null)"
+  names="$(jq -r '.dependencies // {} | keys[]' <<<"$listing" 2>/dev/null)" || return 1
+
+  while read -r pkg; do
+    [ -n "$pkg" ] || continue
+    if held "$(npm_component "$pkg")"; then
+      printf '  leaving %s alone (held)\n' "$pkg"
+      continue
+    fi
+    pkgs+=("$pkg")
+  done <<<"$names"
+
+  if [ ${#pkgs[@]} -eq 0 ]; then
+    printf '  no npm globals to update\n'
+    return 0
+  fi
+  npm update -g "${pkgs[@]}" || return 1
   restore_pnpm_bins
 }
 
 # pnpm's global bin directory is not on this machine's PATH, which makes pnpm
 # refuse every global command. Supply it for the duration of the call only.
+#
+# No `--latest`: that ignores the version range a package was installed with
+# and jumps major versions, which is not something to do unattended.
 update_pnpm_globals() {
   if [ ! -d "$PNPM_GLOBAL_HOME" ]; then
     skip "pnpm globals — no global store at $PNPM_GLOBAL_HOME"
@@ -211,7 +283,63 @@ update_pnpm_globals() {
   pnpm_bin="$(command -v pnpm)" || return 1
 
   PNPM_HOME="$PNPM_GLOBAL_HOME" PATH="$PNPM_GLOBAL_HOME/bin:$PATH" \
-    "$pnpm_bin" update -g --latest
+    "$pnpm_bin" update -g
+}
+
+# Names of the features `moshi-hook doctor --json` reports as ok, one per line.
+moshi_ok_features() {
+  jq -r '.features[]? | select(.status == "ok") | .id' <<<"$1" 2>/dev/null | sort
+}
+
+# Updating the moshi-hook binary is only half of the job: the hooks written
+# into each agent belong to the build that wrote them, and the daemon keeps
+# running the old binary until it restarts.
+#
+# doctor is only ever run with --json. With --yes it applies its fixes without
+# asking, which would install hooks and change host settings nobody chose.
+update_moshi_hook() {
+  local bin before_sha after_sha before_doc after_doc ready agent home regressed status=0
+  bin="$(command -v moshi-hook)" || return 1
+  before_sha="$(sha256sum "$bin" | cut -d' ' -f1)"
+  before_doc="$(moshi-hook doctor --json 2>/dev/null </dev/null)"
+  # Only agents that already have hooks get them reinstalled; an update must
+  # never wire Moshi into an agent the user did not set up.
+  ready="$(jq -r '.features[]? | select(.id == "inbox") | .readyAgents[]?' <<<"$before_doc" 2>/dev/null)"
+
+  moshi-hook update || return 1
+
+  while read -r agent; do
+    case "$agent" in
+      "") ;;
+      pi)
+        # Pi hooks live inside a Pi home, and there are two of them.
+        for home in "${PI_HOMES[@]}"; do
+          [ -d "$home" ] || continue
+          PI_CODING_AGENT_DIR="$home" moshi-hook install --target pi || status=1
+        done
+        ;;
+      *)
+        moshi-hook install --target "$agent" || status=1
+        ;;
+    esac
+  done <<<"$ready"
+
+  # Restarting drops the live connection to the phone, so only do it when
+  # there is a new binary to load.
+  after_sha="$(sha256sum "$bin" | cut -d' ' -f1)"
+  if [ "$before_sha" != "$after_sha" ]; then
+    moshi-hook service restart || status=1
+  else
+    printf '  moshi-hook binary unchanged; daemon left running\n'
+  fi
+
+  after_doc="$(moshi-hook doctor --json 2>/dev/null </dev/null)"
+  regressed="$(comm -23 <(moshi_ok_features "$before_doc") <(moshi_ok_features "$after_doc") | paste -sd, -)"
+  if [ -n "$regressed" ]; then
+    warn "moshi-hook doctor: no longer ok after the update: $regressed"
+    status=1
+  fi
+  return $status
 }
 
 # --- runtimes ----------------------------------------------------------------
@@ -230,7 +358,7 @@ update_runtimes() {
 check_pi_homes() {
   command -v jq >/dev/null 2>&1 || return 0
   local home file dupes
-  for home in "${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" "${GENTLE_SHELL_HOME:-$HOME/.gentle-shell/agent}"; do
+  for home in "${PI_HOMES[@]}"; do
     file="$home/settings.json"
     [ -f "$file" ] || continue
     dupes="$(jq -r '
@@ -252,7 +380,7 @@ check_pi_homes() {
 # for the same package exists in the Gentle Shell home, and say so out loud.
 dedupe_gentle_shell_home() {
   command -v jq >/dev/null 2>&1 || return 0
-  local file="${GENTLE_SHELL_HOME:-$HOME/.gentle-shell/agent}/settings.json"
+  local file="${PI_HOMES[1]}/settings.json"
   [ -f "$file" ] || return 0
 
   local before after tmp
@@ -272,26 +400,113 @@ dedupe_gentle_shell_home() {
   rm -f "$tmp"
 }
 
+# A tool that answered `--version` before the run and no longer does was broken
+# by this run. Put it back from the pre-update snapshot; gentle-rollback holds
+# it, so tomorrow's run does not install the same broken release again.
+smoke_check() {
+  local tool
+  for tool in "${WORKED_BEFORE[@]}"; do
+    timeout 20 "$tool" --version >/dev/null 2>&1 </dev/null && continue
+    warn "$tool no longer runs after the update"
+    # The snapshot is named by id: after the first restore `latest` would be
+    # that restore's own pre-rollback snapshot, which holds the broken state.
+    if [ -n "$SNAPSHOT_ID" ] \
+      && "$ROLLBACK" restore "$SNAPSHOT_ID" --only "$tool" --yes 9>&-; then
+      FAILED+=("$tool broke after the update; rolled back and held")
+    else
+      FAILED+=("$tool broke after the update; rollback failed")
+    fi
+  done
+}
+
 # --- main --------------------------------------------------------------------
 
 case "$TARGET" in
   all|agents|toolchain|plugins|packages|runtimes) ;;
+  -h|--help)
+    # The header comment is the manual; print it without the comment markers.
+    sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
   *)
     printf 'usage: gentle-update [all|agents|toolchain|plugins|packages|runtimes]\n' >&2
     exit 2
     ;;
 esac
 
+# Everything this installs belongs to the user. As root it would leave
+# root-owned files in the user's tool directories and update root's own copies.
+if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+  printf 'gentle-update: refusing to run as root; run it as your own user\n' >&2
+  exit 1
+fi
+
 wants() { [ "$TARGET" = all ] || [ "$TARGET" = "$1" ]; }
 
 mkdir -p "$BIN_DIR"
 
+# Under systemd (or any shell that mise did not activate) node, npm, pnpm, go
+# and every npm-installed CLI are missing from PATH. Ask mise for the
+# environment an interactive shell would have. It is resolved from $HOME so a
+# project-local mise config never decides which runtimes get updated.
+if [ -z "${MISE_SHELL:-}" ]; then
+  MISE_BIN="$BIN_DIR/mise"
+  [ -x "$MISE_BIN" ] || MISE_BIN="$(command -v mise 2>/dev/null || true)"
+  if [ -n "$MISE_BIN" ] && cd "$HOME"; then
+    eval "$("$MISE_BIN" env -s bash 2>/dev/null)"
+  fi
+fi
+# Locally installed tools win over the copies mise may also provide.
+if [ -d "$HOME/.opencode/bin" ]; then PATH="$HOME/.opencode/bin:$PATH"; fi
+PATH="$BIN_DIR:$PATH"
+export PATH
+
+# Run every step from $HOME, so a project-local .pi directory or package
+# manifest in the directory this was started from never takes part.
+cd "$HOME" || exit 1
+
+# One lock for gentle-update and gentle-rollback, held on descriptor 9 until
+# this process exits. A run that finds it taken has nothing to do: the other
+# run is already updating (or restoring) the same tools.
+mkdir -p "$STATE" && chmod 700 "$STATE" || exit 1
+exec 9>"$STATE/lock" || exit 1
+if ! flock -n 9; then
+  printf 'gentle-update: another update or rollback is already running; nothing to do.\n'
+  exit 0
+fi
+# Tells the gentle-rollback calls below not to take the lock again.
+export GENTLE_UPDATE_LOCK_HELD=1
+
+# gentle-rollback normally sits next to this script; $0 may be a symlink.
+ROLLBACK="$(dirname "$(readlink -f "$0")")/gentle-rollback"
+[ -x "$ROLLBACK" ] || ROLLBACK="$(command -v gentle-rollback 2>/dev/null || true)"
+
+for tool in "${SMOKE_TOOLS[@]}"; do
+  if timeout 20 "$tool" --version >/dev/null 2>&1 </dev/null; then WORKED_BEFORE+=("$tool"); fi
+done
+
 bold "Before"
 report_versions
 
+# No update without a way back. The snapshot is what `gentle-rollback restore`
+# and the smoke check at the end restore from.
+if [ "${GENTLE_UPDATE_NO_SNAPSHOT:-}" = 1 ]; then
+  warn "GENTLE_UPDATE_NO_SNAPSHOT=1 — updating without a snapshot; this run cannot be rolled back"
+elif [ -z "$ROLLBACK" ]; then
+  warn "gentle-rollback not found next to this script or on PATH; nothing was updated"
+  warn "(set GENTLE_UPDATE_NO_SNAPSHOT=1 to update without a snapshot)"
+  exit 1
+elif SNAPSHOT_ID="$("$ROLLBACK" snapshot --reason "pre-update ($TARGET)" 9>&-)" && [ -n "$SNAPSHOT_ID" ]; then
+  ok "snapshot $SNAPSHOT_ID (undo with: gentle-rollback restore $SNAPSHOT_ID)"
+else
+  warn "the pre-update snapshot failed; nothing was updated"
+  warn "(set GENTLE_UPDATE_NO_SNAPSHOT=1 to update without a snapshot)"
+  exit 1
+fi
+
 if wants agents || wants toolchain || wants packages; then
   heading "Gentle Shell standalone launcher"
-  step "Gentle Shell launcher (npm:${GENTLE_SHELL_NPM_PACKAGE})" npm install_gentle_shell
+  step gentle-shell "Gentle Shell launcher (npm:${GENTLE_SHELL_NPM_PACKAGE})" npm install_gentle_shell
 fi
 
 if wants agents || wants toolchain; then
@@ -299,50 +514,54 @@ if wants agents || wants toolchain; then
   if wants agents; then
     # --all also refreshes the packages the plain `pi` home declares, so it
     # never lags behind the isolated Gentle Shell home.
-    step "PATH Pi runtime + extensions" pi pi update --all
+    step pi "PATH Pi runtime + extensions" pi pi update --all
+    # --all does not touch the model catalogs; those have their own flag.
+    step pi "Pi model catalog" pi pi update --models
   fi
-  step "Gentle Shell setup" gentle-shell gentle-shell --isolated setup
+  step gentle-shell "Gentle Shell setup" gentle-shell gentle-shell --isolated setup
 fi
 
 if wants agents; then
   heading "AI agents (latest stable)"
-  step "Claude Code" claude   claude update
-  step "Codex"       codex    codex update
-  step "OpenCode"    opencode opencode upgrade
-  step "Gentle Shell extensions" gentle-shell gentle-shell --isolated update --extensions
+  step claude   "Claude Code" claude   claude update
+  step codex    "Codex"       codex    codex update
+  step opencode "OpenCode"    opencode opencode upgrade
+  step gentle-shell "Gentle Shell extensions"    gentle-shell gentle-shell --isolated update --extensions
+  step gentle-shell "Gentle Shell model catalog" gentle-shell gentle-shell --isolated update --models
   update_herdr
 fi
 
 if wants toolchain; then
   heading "Gentleman toolchain (latest release)"
-  step "gentle-ai" go install_release gentle-ai "$GENTLE_AI_PKG"
-  step "engram"    go install_release engram    "$ENGRAM_PKG"
+  step gentle-ai "gentle-ai" go install_release gentle-ai "$GENTLE_AI_PKG"
+  step engram    "engram"    go install_release engram    "$ENGRAM_PKG"
   sync_gentle_ai_dev_override
 fi
 
 if wants plugins; then
   heading "Claude Code plugins"
-  step "Claude Code plugins" claude update_claude_plugins
+  step claude-plugins "Claude Code plugins" claude update_claude_plugins
 fi
 
 if wants packages; then
   heading "Global packages"
-  step "npm globals"  npm   update_npm_globals
-  step "pnpm globals" pnpm  update_pnpm_globals
-  step "moshi-hook"   moshi-hook moshi-hook update
-  step "mise"         mise  mise self-update --yes
+  step npm-globals  "npm globals"  npm        update_npm_globals
+  step pnpm-globals "pnpm globals" pnpm       update_pnpm_globals
+  step moshi-hook   "moshi-hook"   moshi-hook update_moshi_hook
+  step mise         "mise"         mise       mise self-update --yes
 fi
 
 # Opt-in only: never reached by `all`.
 if [ "$TARGET" = runtimes ]; then
   heading "Language runtimes (mise)"
-  step "mise runtimes" mise update_runtimes
+  step runtimes "mise runtimes" mise update_runtimes
 fi
 
 hash -r 2>/dev/null || true
 
 dedupe_gentle_shell_home
 check_pi_homes
+smoke_check
 
 bold "After"
 report_versions

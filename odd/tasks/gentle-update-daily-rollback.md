@@ -75,7 +75,7 @@ Retention: `GENTLE_UPDATE_KEEP_SNAPSHOTS` (default 7), then unreferenced
 - [x] **T1** `gentle-rollback`: `snapshot`, `list`, `show`, `restore`, `holds`,
   `hold`, `unhold`, with sandboxed tests. Route: delegated (writer trigger: 2+
   non-trivial files in the feature).
-- [ ] **T2** `gentle-update` integration: mise/PATH bootstrap, `cd $HOME`, lock,
+- [x] **T2** `gentle-update` integration: mise/PATH bootstrap, `cd $HOME`, lock,
   pre-update snapshot, per-step holds, per-package npm globals, `--models`
   refresh, Moshi hooks + conditional daemon restart + `doctor --json`, pnpm
   without `--latest`, drop `.prev`, smoke check with auto-rollback. Route: delegated.
@@ -96,6 +96,7 @@ Retention: `GENTLE_UPDATE_KEEP_SNAPSHOTS` (default 7), then unreferenced
 
 - `shellcheck scripts/linux/gentle-update scripts/linux/gentle-rollback scripts/linux/tests/*.sh`
 - `bash scripts/linux/tests/gentle-rollback.test.sh`
+- `bash scripts/linux/tests/gentle-update.test.sh`
 - `systemd-analyze --user verify scripts/linux/systemd/gentle-update.service scripts/linux/systemd/gentle-update.timer`
 
 Test-first: no test runner exists in the repo. The sandboxed bash test is
@@ -131,3 +132,16 @@ deferred until one is.
   - Accepted additions to the brief: `snapshot` also takes the lock; retention
     never prunes the snapshot being restored; `hold`/`unhold` also accept
     `runtimes` (gentle-update honours it, nothing is restorable for it).
+- **T2** done. Route: delegated (same writer).
+  - RED: `bash scripts/linux/tests/gentle-update.test.sh` against the
+    unchanged script: exit 1, 26 FAIL / 17 ok.
+  - GREEN: same command: exit 0, 43 ok, `all cases passed`.
+  - `shellcheck` on both scripts and both tests: clean (also fixed the
+    pre-existing SC1007 on `GOFLAGS=`).
+  - Bare environment (`env -i HOME PATH=/usr/bin:/bin`) after the mise
+    bootstrap resolves npm, pnpm, go, pi, gentle-shell, codex, claude, opencode.
+  - Accepted changes to the brief: the smoke check restores the pre-update
+    snapshot by id instead of `latest` (after a first restore `latest` is that
+    restore's pre-rollback snapshot, which holds the broken state); with
+    `GENTLE_UPDATE_NO_SNAPSHOT=1` a broken tool is reported, not rolled back.
+  - Not exercised: a real `gentle-update` run (forbidden for the writer).
