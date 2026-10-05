@@ -1,0 +1,776 @@
+#!/usr/bin/env bash
+# gentle-rollback — undo what gentle-update installed.
+#
+# Companion to gentle-update. Before every run gentle-update asks this script
+# for a snapshot of the machine's tool state; `restore` puts selected
+# components back the way a snapshot recorded them and places a hold on each
+# one, so the next daily run does not reinstall the release that was just
+# rolled back.
+#
+# Components and how each one is recorded / restored:
+#
+#   gentle-ai engram herdr    The binary itself, content-addressed in store/.
+#   moshi-hook                The binary, then agent hooks and the daemon.
+#   mise claude opencode      The version; restored with the tool's own
+#                             installer pinned to that version.
+#   pi gentle-shell           The npm global version plus a whitelist of files
+#                             from the Pi home (settings, extensions, lockfile).
+#   codex npm-globals         npm global versions.
+#   pnpm-globals              pnpm global versions.
+#   claude-plugins            installed_plugins.json.
+#
+# Limits, on purpose:
+#
+#   - A restore never uninstalls. Packages and files added after the snapshot
+#     stay where they are.
+#   - Credentials (auth.json, tokens) are never copied into a snapshot.
+#   - Language runtimes managed by mise are not recorded and cannot be restored.
+#   - The Claude plugin cache is not copied; the plugin list is only restored
+#     while every install path it names still exists.
+#
+# State lives in ${GENTLE_UPDATE_STATE_DIR:-~/.local/state/gentle-update}:
+#
+#   snapshots/<id>/   one directory per snapshot
+#   store/<sha256>    binaries, shared between snapshots
+#   holds/<component> one file per held component
+#   lock              flock shared with gentle-update
+#
+# Usage:
+#   gentle-rollback snapshot [--reason <text>]   create a snapshot, print its id
+#   gentle-rollback list                         snapshots, newest first
+#   gentle-rollback show [<id>|latest]           snapshot state vs current state
+#   gentle-rollback restore [<id>|latest] [--only a,b] [--yes] [--dry-run]
+#   gentle-rollback holds                        list held components
+#   gentle-rollback hold <component> [reason]
+#   gentle-rollback unhold <component|all>
+#
+#   --only     Restore just these components (comma separated).
+#   --yes      Do not ask for confirmation. Required without a terminal.
+#   --dry-run  Print the plan and every command without changing anything.
+#
+# A restore first snapshots the current state, so a rollback is itself
+# reversible. Each component is isolated: a failure is reported at the end and
+# never stops the remaining components.
+
+set -uo pipefail
+
+STATE="${GENTLE_UPDATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gentle-update}"
+BIN_DIR="${GENTLE_UPDATE_BIN_DIR:-$HOME/.local/bin}"
+KEEP="${GENTLE_UPDATE_KEEP_SNAPSHOTS:-7}"
+PI_HOME="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}"
+GENTLE_SHELL_HOME_DIR="${GENTLE_SHELL_HOME:-$HOME/.gentle-shell/agent}"
+PLUGINS_FILE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
+PNPM_GLOBAL_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
+
+COMPONENTS=(gentle-ai engram herdr moshi-hook mise claude opencode pi gentle-shell
+  codex npm-globals pnpm-globals claude-plugins)
+# Standalone binaries in BIN_DIR, saved byte for byte.
+BINARIES=(gentle-ai engram herdr moshi-hook)
+# Tools whose `--version` line is recorded.
+VERSIONED=(gentle-ai engram herdr moshi-hook mise claude opencode pi gentle-shell codex)
+# Files and directories copied from each Pi home. Everything else in a home
+# (auth.json, sessions, caches) is either a credential or not worth restoring.
+HOME_WHITELIST=(settings.json models-store.json extensions agents gentle-ai skills
+  chains npm/package.json npm/package-lock.json)
+# Credential-looking names are excluded even inside whitelisted directories.
+CREDENTIAL_EXCLUDES=(--exclude=auth.json --exclude='*.token' --exclude=.env
+  --exclude='.env.*' --exclude=credentials.json)
+
+PI_NPM_PACKAGE="@earendil-works/pi-coding-agent"
+# The npm package name remains gentle-pi; it installs the gentle-shell command.
+GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
+CODEX_NPM_PACKAGE="@openai/codex"
+
+DRY_RUN=0
+CUR=""           # scratch capture of the current state, compared with a snapshot
+SNAP=""          # snapshot directory being shown or restored
+PROTECT_ID=""    # snapshot that retention must not prune (the one being restored)
+
+bold()    { printf '\n\033[1m%s\033[0m\n' "$*"; }
+ok()      { printf '\033[32m✓\033[0m %s\n' "$*"; }
+warn()    { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+die()     { warn "$1"; exit "${2:-1}"; }
+
+usage() {
+  cat <<'EOF'
+usage:
+  gentle-rollback snapshot [--reason <text>]   create a snapshot, print its id
+  gentle-rollback list                         snapshots, newest first
+  gentle-rollback show [<id>|latest]           snapshot state vs current state
+  gentle-rollback restore [<id>|latest] [--only a,b] [--yes] [--dry-run]
+  gentle-rollback holds                        list held components
+  gentle-rollback hold <component> [reason]
+  gentle-rollback unhold <component|all>
+EOF
+}
+
+# Perform one mutation, or describe it under --dry-run. The lock descriptor is
+# closed for the child so a daemon it starts can never keep the lock alive.
+run() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  \033[2mwould run:\033[0m %s\n' "$*"
+    return 0
+  fi
+  "$@" 9>&-
+}
+
+is_component() {
+  local c
+  for c in "${COMPONENTS[@]}"; do [ "$c" = "$1" ] && return 0; done
+  return 1
+}
+
+# `runtimes` has nothing to restore, but gentle-update honours a hold on it.
+is_holdable() { is_component "$1" || [ "$1" = runtimes ]; }
+
+require_component() {
+  is_component "$1" || die "unknown component '$1' (one of: ${COMPONENTS[*]})" 2
+}
+
+sha_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# Extract the bare version number from a `--version` line, for example
+# "2.1.289 (Claude Code)" -> "2.1.289". Fails when the line holds no version.
+version_number() {
+  local n
+  n="$(printf '%s\n' "$1" | rg -o '[0-9]+(\.[0-9]+)+(-[0-9A-Za-z.]+)?' | head -1)"
+  [ -n "$n" ] || return 1
+  printf '%s\n' "$n"
+}
+
+tool_version() {
+  command -v "$1" >/dev/null 2>&1 || { echo "-"; return; }
+  local v
+  v="$(timeout 20 "$1" --version 2>/dev/null </dev/null | head -1 | tr -d '\r\t')"
+  echo "${v:--}"
+}
+
+# pnpm refuses every global command unless its global bin directory is on
+# PATH. Resolve pnpm before touching PATH: that directory holds a stale pnpm
+# shim that would otherwise win the lookup and fail to exec.
+pnpm_global() {
+  local pnpm_bin
+  pnpm_bin="$(command -v pnpm)" || return 1
+  PNPM_HOME="$PNPM_GLOBAL_HOME" PATH="$PNPM_GLOBAL_HOME/bin:$PATH" "$pnpm_bin" "$@"
+}
+
+npm_component() {
+  case "$1" in
+    "$PI_NPM_PACKAGE")           echo pi ;;
+    "$GENTLE_SHELL_NPM_PACKAGE") echo gentle-shell ;;
+    "$CODEX_NPM_PACKAGE")        echo codex ;;
+    *)                           echo npm-globals ;;
+  esac
+}
+
+home_of() {
+  case "$1" in
+    pi)           echo "$PI_HOME" ;;
+    gentle-shell) echo "$GENTLE_SHELL_HOME_DIR" ;;
+  esac
+}
+
+# The state directory holds copies of tool configuration; keep it private.
+ensure_state_dir() { mkdir -p "$STATE" && chmod 700 "$STATE"; }
+
+# --- lock --------------------------------------------------------------------
+
+# One lock serialises gentle-update and gentle-rollback. gentle-update holds it
+# for its whole run and says so through GENTLE_UPDATE_LOCK_HELD.
+acquire_lock() {
+  [ "${GENTLE_UPDATE_LOCK_HELD:-}" = 1 ] && return 0
+  ensure_state_dir || die "cannot create $STATE"
+  exec 9>"$STATE/lock" || die "cannot open $STATE/lock"
+  flock -n 9 || die "an update or rollback is already running (lock: $STATE/lock)"
+}
+
+# --- reading a captured state ------------------------------------------------
+
+# Field 2 of the row whose field 1 is <key> in a two-column TSV file.
+tsv_get() {
+  [ -f "$1" ] || return 0
+  awk -F'\t' -v k="$2" '$1 == k { print $2; exit }' "$1"
+}
+
+# pkg_table <npm|pnpm> <dir> -> "package<TAB>version" per global package.
+pkg_table() {
+  local file="$2/$1-globals.json"
+  [ -f "$file" ] || return 0
+  case "$1" in
+    npm)
+      jq -r '.dependencies // {} | to_entries[]
+             | select(.value.version != null) | "\(.key)\t\(.value.version)"' "$file" ;;
+    pnpm)
+      jq -r '[.[]? | .dependencies // {} | to_entries[]] | .[]
+             | select(.value.version != null) | "\(.key)\t\(.value.version)"' "$file" ;;
+  esac 2>/dev/null
+}
+
+# pkg_changes <component> -> "package<TAB>current<TAB>snapshot" for every
+# package of that component whose version moved since the snapshot. Packages
+# installed after the snapshot are not listed: a restore never uninstalls.
+pkg_changes() {
+  local comp="$1" kind=npm pkg want have current
+  [ "$comp" = pnpm-globals ] && kind=pnpm
+  current="$(pkg_table "$kind" "$CUR")"
+  while IFS=$'\t' read -r pkg want; do
+    [ -n "$pkg" ] || continue
+    if [ "$kind" = npm ] && [ "$(npm_component "$pkg")" != "$comp" ]; then continue; fi
+    have="$(awk -F'\t' -v p="$pkg" '$1 == p { print $2; exit }' <<<"$current")"
+    [ "$have" = "$want" ] || printf '%s\t%s\t%s\n' "$pkg" "${have:--}" "$want"
+  done < <(pkg_table "$kind" "$SNAP")
+}
+
+# Relative paths of the snapshot's home files that are missing or different in
+# the live home. Files that only exist in the live home never count.
+home_diff() {
+  local snap_home="$SNAP/homes/$1" live rel
+  live="$(home_of "$1")"
+  [ -d "$snap_home" ] || return 0
+  while IFS= read -r rel; do
+    if [ -L "$snap_home/$rel" ]; then
+      [ "$(readlink "$snap_home/$rel")" = "$(readlink "$live/$rel" 2>/dev/null)" ] || printf '%s\n' "$rel"
+    else
+      cmp -s "$snap_home/$rel" "$live/$rel" || printf '%s\n' "$rel"
+    fi
+  done < <(find "$snap_home" \( -type f -o -type l \) -printf '%P\n' | sort)
+}
+
+# One line per thing that differs between the snapshot and now, written as
+# "current -> snapshot". No output means the component does not differ.
+comp_diff() {
+  local comp="$1" want have pkg rel
+  case "$comp" in
+    gentle-ai|engram|herdr|moshi-hook)
+      want="$(tsv_get "$SNAP/binaries.tsv" "$comp")"
+      have="$(tsv_get "$CUR/binaries.tsv" "$comp")"
+      # A binary that was not there at snapshot time cannot be restored.
+      [ -n "$want" ] || return 0
+      [ "$want" = "$have" ] && return 0
+      printf '%s (%s) -> %s (%s)\n' \
+        "${have:0:12}" "$(tsv_get "$CUR/versions.tsv" "$comp")" \
+        "${want:0:12}" "$(tsv_get "$SNAP/versions.tsv" "$comp")"
+      ;;
+    mise|claude|opencode)
+      want="$(tsv_get "$SNAP/versions.tsv" "$comp")"
+      have="$(tsv_get "$CUR/versions.tsv" "$comp")"
+      if [ -z "$want" ] || [ "$want" = "-" ]; then return 0; fi
+      [ "$want" = "$have" ] || printf '%s -> %s\n' "${have:--}" "$want"
+      ;;
+    pi|gentle-shell)
+      while IFS=$'\t' read -r pkg have want; do
+        [ -n "$pkg" ] && printf '%s %s -> %s\n' "$pkg" "$have" "$want"
+      done < <(pkg_changes "$comp")
+      while IFS= read -r rel; do
+        [ -n "$rel" ] && printf 'home file %s\n' "$rel"
+      done < <(home_diff "$comp")
+      ;;
+    codex|npm-globals|pnpm-globals)
+      while IFS=$'\t' read -r pkg have want; do
+        [ -n "$pkg" ] && printf '%s %s -> %s\n' "$pkg" "$have" "$want"
+      done < <(pkg_changes "$comp")
+      ;;
+    claude-plugins)
+      [ -f "$SNAP/claude-plugins/installed_plugins.json" ] || return 0
+      cmp -s "$SNAP/claude-plugins/installed_plugins.json" "$PLUGINS_FILE" \
+        || printf 'installed_plugins.json changed\n'
+      ;;
+  esac
+}
+
+# Short description of one component as the snapshot recorded it.
+comp_state() {
+  local comp="$1" sha
+  case "$comp" in
+    gentle-ai|engram|herdr|moshi-hook)
+      sha="$(tsv_get "$SNAP/binaries.tsv" "$comp")"
+      if [ -n "$sha" ]; then
+        printf '%s (%s)\n' "${sha:0:12}" "$(tsv_get "$SNAP/versions.tsv" "$comp")"
+      else
+        echo "not recorded"
+      fi
+      ;;
+    mise|claude|opencode)
+      tsv_get "$SNAP/versions.tsv" "$comp" ;;
+    pi)
+      printf '%s, home files\n' "$(tsv_get "$SNAP/versions.tsv" pi)" ;;
+    gentle-shell)
+      printf '%s, home files\n' "$(tsv_get "$SNAP/versions.tsv" gentle-shell)" ;;
+    codex)
+      tsv_get "$SNAP/versions.tsv" codex ;;
+    npm-globals)
+      printf '%s npm packages\n' "$(pkg_table npm "$SNAP" | wc -l)" ;;
+    pnpm-globals)
+      printf '%s pnpm packages\n' "$(pkg_table pnpm "$SNAP" | wc -l)" ;;
+    claude-plugins)
+      if [ -f "$SNAP/claude-plugins/installed_plugins.json" ]; then
+        echo "installed_plugins.json"
+      else
+        echo "not recorded"
+      fi
+      ;;
+  esac
+}
+
+# --- capturing a state -------------------------------------------------------
+
+# Write the cheap, comparable part of the machine state into <dir>: versions,
+# binary checksums, and package lists. With <store>=1 the binaries themselves
+# are also saved into the content-addressed store.
+capture_state() {
+  local dir="$1" store="${2:-0}" tool sha tmp
+  mkdir -p "$dir" || return 1
+
+  for tool in "${VERSIONED[@]}"; do
+    printf '%s\t%s\n' "$tool" "$(tool_version "$tool")"
+  done > "$dir/versions.tsv"
+
+  : > "$dir/binaries.tsv"
+  for tool in "${BINARIES[@]}"; do
+    # Regular files only: a symlink here is managed by something else.
+    if [ ! -f "$BIN_DIR/$tool" ] || [ -L "$BIN_DIR/$tool" ]; then continue; fi
+    sha="$(sha_of "$BIN_DIR/$tool")"
+    [ -n "$sha" ] || return 1
+    printf '%s\t%s\n' "$tool" "$sha" >> "$dir/binaries.tsv"
+    if [ "$store" = 1 ] && [ ! -f "$STATE/store/$sha" ]; then
+      # Copy under a temporary name so an interrupted copy never looks like a
+      # complete blob.
+      tmp="$STATE/store/.$sha.$$"
+      cp -p "$BIN_DIR/$tool" "$tmp" && mv -f "$tmp" "$STATE/store/$sha" || return 1
+    fi
+  done
+
+  # npm and pnpm can exit non-zero while still printing a usable list (for
+  # example with an extraneous package), so the output is kept when it parses.
+  if command -v npm >/dev/null 2>&1; then
+    npm ls -g --depth=0 --json > "$dir/npm-globals.json" 2>/dev/null </dev/null
+    jq -e . "$dir/npm-globals.json" >/dev/null 2>&1 || rm -f "$dir/npm-globals.json"
+  fi
+  if command -v pnpm >/dev/null 2>&1; then
+    pnpm_global ls -g --depth=0 --json > "$dir/pnpm-globals.json" 2>/dev/null </dev/null
+    jq -e . "$dir/pnpm-globals.json" >/dev/null 2>&1 || rm -f "$dir/pnpm-globals.json"
+  fi
+  return 0
+}
+
+# Capture the current state once into a scratch directory for comparisons.
+capture_current() {
+  [ -n "$CUR" ] && rm -rf "$CUR"
+  CUR="$(mktemp -d)" || die "cannot create a scratch directory"
+  capture_state "$CUR" 0 || die "cannot read the current state"
+}
+trap '[ -n "$CUR" ] && rm -rf "$CUR"' EXIT
+
+# Copy the whitelisted entries of one Pi home, keeping relative paths. tar
+# applies the credential excludes at any depth, so such a file is never written
+# to the snapshot, not even briefly.
+snapshot_home() {
+  local home="$1" dest="$2" entry entries=()
+  for entry in "${HOME_WHITELIST[@]}"; do
+    [ -e "$home/$entry" ] && entries+=("$entry")
+  done
+  [ ${#entries[@]} -gt 0 ] || return 0
+  mkdir -p "$dest" || return 1
+  tar -C "$home" "${CREDENTIAL_EXCLUDES[@]}" -cf - "${entries[@]}" | tar -C "$dest" -xpf -
+}
+
+snapshot_ids() {
+  [ -d "$STATE/snapshots" ] || return 0
+  find "$STATE/snapshots" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -printf '%f\n' | sort
+}
+
+# Drop the oldest snapshots beyond the retention count, then every stored
+# binary that no remaining snapshot references.
+prune() {
+  local ids=() id sha referenced blob excess
+  mapfile -t ids < <(snapshot_ids)
+  excess=$(( ${#ids[@]} - KEEP ))
+  for id in "${ids[@]}"; do
+    [ "$excess" -gt 0 ] || break
+    excess=$((excess - 1))
+    [ "$id" = "$PROTECT_ID" ] && continue
+    rm -rf "${STATE:?}/snapshots/$id"
+  done
+
+  referenced="$(cat "$STATE"/snapshots/[0-9]*/binaries.tsv 2>/dev/null | cut -f2)"
+  for blob in "$STATE"/store/*; do
+    [ -f "$blob" ] || continue
+    sha="$(basename "$blob")"
+    rg -qxF -- "$sha" <<<"$referenced" || rm -f "$blob"
+  done
+}
+
+# Create a snapshot and print its id on stdout (and nothing else there).
+take_snapshot() {
+  local reason="$1" base id n=1 tmp
+  ensure_state_dir || return 1
+  mkdir -p "$STATE/snapshots" "$STATE/store" "$STATE/holds" || return 1
+  # Leftovers of a snapshot that was interrupted before it was published.
+  rm -rf "$STATE"/snapshots/.tmp-*
+
+  base="$(date +%Y%m%d-%H%M%S)"
+  id="$base"
+  while [ -e "$STATE/snapshots/$id" ]; do
+    n=$((n + 1))
+    id="$base-$n"
+  done
+
+  # Build under a hidden name and rename at the end, so `list` and `restore`
+  # never see a half-written snapshot.
+  tmp="$STATE/snapshots/.tmp-$id"
+  mkdir -m 700 "$tmp" || return 1
+  printf '%s\n' "$reason" > "$tmp/reason"
+  capture_state "$tmp" 1 || { rm -rf "$tmp"; return 1; }
+  snapshot_home "$PI_HOME" "$tmp/homes/pi" || { rm -rf "$tmp"; return 1; }
+  snapshot_home "$GENTLE_SHELL_HOME_DIR" "$tmp/homes/gentle-shell" || { rm -rf "$tmp"; return 1; }
+  if [ -f "$PLUGINS_FILE" ]; then
+    if ! { mkdir -p "$tmp/claude-plugins" \
+      && cp -p "$PLUGINS_FILE" "$tmp/claude-plugins/installed_plugins.json"; }; then
+      rm -rf "$tmp"
+      return 1
+    fi
+  fi
+  mv "$tmp" "$STATE/snapshots/$id" || { rm -rf "$tmp"; return 1; }
+
+  prune
+  printf '%s\n' "$id"
+}
+
+# Resolve <id|latest> into SNAP, exiting 2 when there is no such snapshot.
+resolve_snapshot() {
+  local id="${1:-latest}"
+  if [ "$id" = latest ]; then
+    id="$(snapshot_ids | tail -1)"
+    [ -n "$id" ] || die "no snapshots yet (run: gentle-rollback snapshot)" 2
+  fi
+  if [[ ! "$id" =~ ^[0-9][0-9A-Za-z-]*$ ]] || [ ! -d "$STATE/snapshots/$id" ]; then
+    die "unknown snapshot '$id' (see: gentle-rollback list)" 2
+  fi
+  SNAP_ID="$id"
+  SNAP="$STATE/snapshots/$id"
+}
+
+# --- restore actions ---------------------------------------------------------
+
+# Put a stored binary back. The copy lands under a temporary name in BIN_DIR
+# and is renamed over the target: a rename is atomic, and a binary that is
+# currently running cannot be overwritten in place.
+restore_binary() {
+  local name="$1" sha blob tmp
+  sha="$(tsv_get "$SNAP/binaries.tsv" "$name")"
+  blob="$STATE/store/$sha"
+  tmp="$BIN_DIR/.$name.rollback.$$"
+  [ -f "$blob" ] || { warn "$name — stored binary $sha is missing"; return 1; }
+  run cp -p "$blob" "$tmp" && run chmod 755 "$tmp" && run mv -f "$tmp" "$BIN_DIR/$name"
+}
+
+# The hooks written into each agent belong to the moshi-hook build that wrote
+# them, and the daemon keeps running the old binary until it is restarted.
+restore_moshi_hook() {
+  local home status=0
+  restore_binary moshi-hook || return 1
+  for home in "$PI_HOME" "$GENTLE_SHELL_HOME_DIR"; do
+    [ -d "$home" ] || continue
+    run env PI_CODING_AGENT_DIR="$home" moshi-hook install --target pi || status=1
+  done
+  run moshi-hook service restart || status=1
+  return $status
+}
+
+restore_version() {
+  local comp="$1" version
+  version="$(version_number "$(tsv_get "$SNAP/versions.tsv" "$comp")")" \
+    || { warn "$comp — no version number in the snapshot"; return 1; }
+  case "$comp" in
+    mise)     run mise self-update --yes "$version" ;;
+    claude)   run claude install "$version" ;;
+    opencode) run opencode upgrade "$version" ;;
+  esac
+}
+
+# Reinstall every package of the component whose version moved.
+restore_packages() {
+  local comp="$1" pkg have want status=0
+  while IFS=$'\t' read -r pkg have want; do
+    [ -n "$pkg" ] || continue
+    if [ "$comp" = pnpm-globals ]; then
+      if [ "$DRY_RUN" = 1 ]; then
+        printf '  \033[2mwould run:\033[0m pnpm add --global %s\n' "$pkg@$want"
+      else
+        pnpm_global add --global "$pkg@$want" 9>&- || status=1
+      fi
+    else
+      run npm install --global "$pkg@$want" || status=1
+    fi
+  done < <(pkg_changes "$comp")
+  return $status
+}
+
+# pi / gentle-shell: the npm global, then the home files. Files in the snapshot
+# overwrite the live ones; files that are not in the snapshot are left alone.
+restore_pi_home() {
+  local comp="$1" home changed status=0
+  home="$(home_of "$comp")"
+  restore_packages "$comp" || status=1
+
+  changed="$(home_diff "$comp")"
+  if [ -n "$changed" ]; then
+    run mkdir -p "$home" && run cp -a "$SNAP/homes/$comp/." "$home/" || status=1
+    # The extensions under <home>/npm/node_modules follow the lockfile, so a
+    # restored lockfile needs a clean install to take effect.
+    if rg -qxF 'npm/package-lock.json' <<<"$changed"; then
+      run npm ci --prefix "$home/npm" || status=1
+    fi
+  fi
+  return $status
+}
+
+# The plugin list points into Claude Code's plugin cache, which is not part of
+# a snapshot. Restoring a list that names a pruned cache directory would leave
+# plugins that cannot load, so refuse instead.
+restore_claude_plugins() {
+  local saved="$SNAP/claude-plugins/installed_plugins.json" path missing=()
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    [ -e "$path" ] || missing+=("$path")
+  done < <(jq -r '.plugins[]?[]?.installPath // empty' "$saved" 2>/dev/null)
+
+  if [ ${#missing[@]} -gt 0 ]; then
+    warn "claude-plugins — these install paths no longer exist:"
+    printf '    %s\n' "${missing[@]}" >&2
+    return 1
+  fi
+  run mkdir -p "$(dirname "$PLUGINS_FILE")" && run cp -p "$saved" "$PLUGINS_FILE"
+}
+
+restore_component() {
+  case "$1" in
+    gentle-ai|engram|herdr)          restore_binary "$1" ;;
+    moshi-hook)                      restore_moshi_hook ;;
+    mise|claude|opencode)            restore_version "$1" ;;
+    pi|gentle-shell)                 restore_pi_home "$1" ;;
+    codex|npm-globals|pnpm-globals)  restore_packages "$1" ;;
+    claude-plugins)                  restore_claude_plugins ;;
+  esac
+}
+
+write_hold() {
+  mkdir -p "$STATE/holds" || return 1
+  printf '%s\t%s\n' "$(date '+%Y-%m-%d %H:%M')" "$2" > "$STATE/holds/$1"
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_snapshot() {
+  local reason=manual
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --reason)
+        [ $# -ge 2 ] || die "--reason needs a value" 2
+        reason="$2"; shift 2 ;;
+      *) usage >&2; exit 2 ;;
+    esac
+  done
+  acquire_lock
+  take_snapshot "$reason" || die "snapshot failed"
+}
+
+cmd_list() {
+  local ids=() id comp count
+  mapfile -t ids < <(snapshot_ids | sort -r)
+  if [ ${#ids[@]} -eq 0 ]; then
+    warn "no snapshots yet (run: gentle-rollback snapshot)"
+    return 0
+  fi
+  capture_current
+  for id in "${ids[@]}"; do
+    SNAP="$STATE/snapshots/$id"
+    count=0
+    for comp in "${COMPONENTS[@]}"; do
+      [ -n "$(comp_diff "$comp")" ] && count=$((count + 1))
+    done
+    printf '%-19s %-32s %s differ\n' "$id" "$(head -1 "$SNAP/reason" 2>/dev/null)" "$count"
+  done
+}
+
+cmd_show() {
+  local comp diff
+  [ $# -le 1 ] || { usage >&2; exit 2; }
+  resolve_snapshot "${1:-latest}"
+  capture_current
+  bold "Snapshot $SNAP_ID — $(head -1 "$SNAP/reason" 2>/dev/null)"
+  for comp in "${COMPONENTS[@]}"; do
+    diff="$(comp_diff "$comp")"
+    if [ -z "$diff" ]; then
+      printf '  %-15s %-8s %s\n' "$comp" "same" "$(comp_state "$comp")"
+    else
+      # Differences read "current -> snapshot", the direction a restore moves.
+      printf '  %-15s \033[33m%-8s\033[0m %s\n' "$comp" "differs" "$(head -1 <<<"$diff")"
+      tail -n +2 <<<"$diff" | sed 's/^/                           /'
+    fi
+  done
+}
+
+cmd_restore() {
+  local id=latest only="" yes=0 comp diff answer
+  local plan=() restored=() failed=() wanted=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --only)
+        [ $# -ge 2 ] || die "--only needs a value" 2
+        only="$2"; shift 2 ;;
+      --yes)     yes=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      -*)        usage >&2; exit 2 ;;
+      *)         id="$1"; shift ;;
+    esac
+  done
+
+  if [ -n "$only" ]; then
+    IFS=, read -ra wanted <<<"$only"
+    for comp in "${wanted[@]}"; do require_component "$comp"; done
+  fi
+
+  acquire_lock
+  resolve_snapshot "$id"
+  capture_current
+
+  for comp in "${COMPONENTS[@]}"; do
+    if [ -n "$only" ] && [[ ",$only," != *",$comp,"* ]]; then continue; fi
+    [ -n "$(comp_diff "$comp")" ] && plan+=("$comp")
+  done
+  if [ ${#plan[@]} -eq 0 ]; then
+    ok "Nothing to restore: the selected components match snapshot $SNAP_ID."
+    return 0
+  fi
+
+  bold "Restore from snapshot $SNAP_ID — $(head -1 "$SNAP/reason" 2>/dev/null)"
+  printf '  (current -> snapshot)\n'
+  for comp in "${plan[@]}"; do
+    diff="$(comp_diff "$comp")"
+    printf '  %-15s %s\n' "$comp" "$(head -1 <<<"$diff")"
+    tail -n +2 <<<"$diff" | sed 's/^/                  /'
+  done
+
+  if [ "$DRY_RUN" = 1 ]; then
+    for comp in "${plan[@]}"; do
+      printf '\n\033[1m%s\033[0m\n' "$comp"
+      restore_component "$comp"
+    done
+    printf '\nDry run: nothing was changed, no snapshot and no holds were created.\n'
+    return 0
+  fi
+
+  if [ "$yes" != 1 ]; then
+    # Without a terminal nobody can answer, and a restore must never be the
+    # silent default.
+    [ -t 0 ] || die "refusing to restore without --yes when stdin is not a terminal"
+    read -r -p 'Restore these components? [y/N] ' answer
+    case "$answer" in
+      y|Y|yes|YES) ;;
+      *) die "aborted; nothing was changed" ;;
+    esac
+  fi
+
+  # Snapshot what is about to be replaced, so this rollback can itself be
+  # rolled back. Retention must not prune the snapshot being restored.
+  PROTECT_ID="$SNAP_ID"
+  local undo
+  undo="$(take_snapshot "pre-rollback of $SNAP_ID")" \
+    || die "could not snapshot the current state; nothing was changed"
+  ok "current state saved as snapshot $undo"
+
+  for comp in "${plan[@]}"; do
+    printf '\n\033[1m%s\033[0m\n' "$comp"
+    if restore_component "$comp"; then
+      write_hold "$comp" "rolled back to $SNAP_ID"
+      restored+=("$comp")
+      ok "$comp restored and held"
+    else
+      failed+=("$comp")
+      warn "$comp — restore failed"
+    fi
+  done
+
+  if [ ${#restored[@]} -gt 0 ]; then
+    bold "Restored and held"
+    printf '  • %s\n' "${restored[@]}"
+    printf '\ngentle-update skips held components. Release one with: gentle-rollback unhold <component>\n'
+    printf 'Undo this rollback with: gentle-rollback restore %s\n' "$undo"
+  fi
+  if [ ${#failed[@]} -gt 0 ]; then
+    bold "Failed"
+    printf '  • %s\n' "${failed[@]}"
+    exit 1
+  fi
+}
+
+cmd_holds() {
+  local file found=0
+  for file in "$STATE"/holds/*; do
+    [ -f "$file" ] || continue
+    found=1
+    printf '%-15s %s\n' "$(basename "$file")" "$(head -1 "$file" | tr '\t' ' ')"
+  done
+  [ "$found" = 1 ] || printf 'no components are held\n'
+}
+
+cmd_hold() {
+  [ $# -ge 1 ] || { usage >&2; exit 2; }
+  local comp="$1"; shift
+  is_holdable "$comp" || die "unknown component '$comp' (one of: ${COMPONENTS[*]} runtimes)" 2
+  write_hold "$comp" "${*:-held manually}" || die "cannot write the hold"
+  ok "$comp is held; gentle-update will skip it"
+}
+
+cmd_unhold() {
+  [ $# -eq 1 ] || { usage >&2; exit 2; }
+  if [ "$1" = all ]; then
+    rm -f "$STATE"/holds/*
+    ok "all holds released"
+    return 0
+  fi
+  is_holdable "$1" || die "unknown component '$1' (one of: ${COMPONENTS[*]} runtimes)" 2
+  if [ -f "$STATE/holds/$1" ]; then
+    rm -f "$STATE/holds/$1"
+    ok "$1 released; the next gentle-update will update it"
+  else
+    warn "$1 is not held"
+  fi
+}
+
+# --- main --------------------------------------------------------------------
+
+# A snapshot taken as root would be unreadable by the user, and a restore as
+# root would leave root-owned files in the user's tool directories.
+if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+  die "refusing to run as root; run gentle-rollback as your own user"
+fi
+
+# The tracked binaries live in BIN_DIR; make sure those are the ones measured
+# and invoked even when another directory comes first on PATH.
+PATH="$BIN_DIR:$PATH"
+
+COMMAND="${1:-}"
+[ $# -gt 0 ] && shift
+
+case "$COMMAND" in
+  snapshot) cmd_snapshot "$@" ;;
+  list)     cmd_list ;;
+  show)     cmd_show "$@" ;;
+  restore)  cmd_restore "$@" ;;
+  holds)    cmd_holds ;;
+  hold)     cmd_hold "$@" ;;
+  unhold)   cmd_unhold "$@" ;;
+  # Internal: exposes the version parser to the tests.
+  version-number) version_number "${1:-}" ;;
+  ""|-h|--help)
+    usage
+    printf '\n'
+    cmd_list
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
