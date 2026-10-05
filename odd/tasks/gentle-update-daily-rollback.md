@@ -79,7 +79,7 @@ Retention: `GENTLE_UPDATE_KEEP_SNAPSHOTS` (default 7), then unreferenced
   pre-update snapshot, per-step holds, per-package npm globals, `--models`
   refresh, Moshi hooks + conditional daemon restart + `doctor --json`, pnpm
   without `--latest`, drop `.prev`, smoke check with auto-rollback. Route: delegated.
-- [ ] **T3** systemd service + timer and README section. Route: delegated.
+- [x] **T3** systemd service + timer and README section. Route: delegated.
 - [ ] **T4** Install: symlink `gentle-rollback`, link and enable the timer, take
   one real snapshot and read it back. Route: inline (parent, state commands).
 
@@ -145,3 +145,19 @@ deferred until one is.
     restore's pre-rollback snapshot, which holds the broken state); with
     `GENTLE_UPDATE_NO_SNAPSHOT=1` a broken tool is reported, not rolled back.
   - Not exercised: a real `gentle-update` run (forbidden for the writer).
+- **T3** done. Route: delegated (same writer).
+  - `systemd-analyze --user verify` on both units: exit 0; the only output is
+    an unrelated warning about `/usr/lib/systemd/user/spice-vdagent.service`.
+  - README section is passive documentation: structural readback only.
+- **T4** pending (parent): symlink `gentle-rollback`, link the service, enable
+  the timer, take one real snapshot.
+
+Commits on `feat/gentle-update-daily-rollback` after `acc7451`:
+
+- `63c4356` T1 `feat(scripts): add gentle-rollback with snapshots and holds`
+- `f54189e` T2 `feat(scripts): make gentle-update safe for unattended runs`
+- T3 `feat(scripts): add daily systemd timer for gentle-update` (the commit
+  that adds this line; see `git log`)
+
+Next step: T4, then the first unattended run is worth reading in the journal,
+since no real `gentle-update` run has exercised the new code yet.

@@ -1,0 +1,15 @@
+# Runs gentle-update.service once a day.
+#
+# Next run:   systemctl --user list-timers gentle-update.timer
+
+[Unit]
+Description=Daily gentle-update
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+# Catch up after boot when the machine was off at 04:00.
+Persistent=true
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,21 @@
+# Daily unattended run of gentle-update. Started by gentle-update.timer; there
+# is no [Install] section because nothing else should pull it in.
+#
+# Read the last run:   journalctl --user -u gentle-update -e
+# Follow a run:        journalctl --user -u gentle-update -f
+# Run it now:          systemctl --user start gentle-update
+#
+# gentle-update exits 1 when any step failed, so a bad run shows up as a failed
+# unit in `systemctl --user status gentle-update`.
+
+[Unit]
+Description=Update local development tools (gentle-update)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/gentle-update all
+# Builds and package installs should not compete with interactive work.
+Nice=10
+# A full run downloads releases and compiles Go binaries; a oneshot unit has
+# no start timeout by default, so bound it explicitly.
+TimeoutStartSec=45min
