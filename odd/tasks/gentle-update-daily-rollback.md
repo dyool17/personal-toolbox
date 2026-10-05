@@ -80,7 +80,7 @@ Retention: `GENTLE_UPDATE_KEEP_SNAPSHOTS` (default 7), then unreferenced
   refresh, Moshi hooks + conditional daemon restart + `doctor --json`, pnpm
   without `--latest`, drop `.prev`, smoke check with auto-rollback. Route: delegated.
 - [x] **T3** systemd service + timer and README section. Route: delegated.
-- [ ] **T4** Install: symlink `gentle-rollback`, link and enable the timer, take
+- [x] **T4** Install: symlink `gentle-rollback`, link and enable the timer, take
   one real snapshot and read it back. Route: inline (parent, state commands).
 - [x] **T5** Fail closed on the unattended path: blob pruning, dependency
   preflight, retention value, empty `--only`, Moshi restore invariant, smoke
@@ -187,3 +187,26 @@ acknowledged (lineage `review-cbc5586b681241d8`), assessed tier high.
   - Not changed (out of the stated scope): `gentle-update` itself still
     reinstalls the Pi Moshi hook in every existing Pi home when `pi` was a
     ready agent; only the restore path was restricted to homes that had it.
+- **Follow-up** `3a00ac6` `fix(scripts): keep Moshi hooks per home and tolerate npm ls warnings`.
+  Route: inline (one file plus its test). Supersedes the last two T5 notes:
+  the Moshi step now reinstalls the Pi hook only in a home that already has
+  `extensions/moshi-hooks.ts`, and a non-zero `npm ls -g` no longer fails the
+  step when its listing still parses. `shellcheck` clean; both test scripts
+  `all cases passed`.
+- **T4** done. Route: inline (parent, state commands, 2026-10-05).
+  - `~/.local/bin/gentle-rollback` symlinked to the repo script.
+  - `systemctl --user link` on the service and `enable --now` on the timer;
+    `list-timers` shows the next run on 2026-10-06 at about 04:07.
+  - Real snapshot `20261005-152617` (`initial baseline`); `show latest` lists
+    all 13 components as `same`. State dir is 107M.
+  - Under `systemd-run --user`, the mise bootstrap resolves every tool the
+    scripts call.
+  - Not exercised: a real `gentle-update` run.
+
+Review of the follow-up commits: assessed tier high. Consent was declined for
+both candidates (`cc89e9f..3a00ac6` and the whole branch), so no review record
+exists for them. The parent re-ran `shellcheck` and both test scripts on
+`3a00ac6`.
+
+Next step: read the first unattended run with
+`journalctl --user -u gentle-update`, then decide on merging to `main`.
