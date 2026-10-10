@@ -71,7 +71,7 @@ the isolated home provisioning (`gentle-shell --isolated setup/update`).
 ## Tasks
 
 - [x] T1 — gentle-ai follows `main`. Route: delegated (single writer for T1–T3).
-- [ ] T2 — Gentle Shell launcher installs from a resolved `main` commit and is
+- [x] T2 — Gentle Shell launcher installs from a resolved `main` commit and is
   left out of the blanket npm update. Route: delegated.
 - [ ] T3 — `gentle-rollback` records and restores the Gentle Shell commit.
   Route: delegated.
@@ -109,5 +109,11 @@ Strategy: `ask-on-risk`. Forecast: about 200 authored changed lines, under the
   before the pin changed. GREEN: `bash scripts/linux/tests/gentle-update.test.sh`
   ends with `all cases passed`; `bash -n scripts/linux/gentle-update` is clean.
   `install_release` was renamed `install_go_binary`.
+- T2 done in `b4de0b9`. RED: 24 cases failed before the implementation (resolve,
+  install by commit, record, skip when unchanged, the three unresolved shapes,
+  and both `npm update -g` lists that still named `gentle-pi`). GREEN:
+  `bash scripts/linux/tests/gentle-update.test.sh` ends with `all cases passed`;
+  `bash -n scripts/linux/gentle-update` is clean. The lookup runs under
+  `timeout 60` with `GIT_TERMINAL_PROMPT=0` so an unattended run cannot hang.
 
-Next step: T2.
+Next step: T3.
