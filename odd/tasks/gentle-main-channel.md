@@ -73,7 +73,7 @@ the isolated home provisioning (`gentle-shell --isolated setup/update`).
 - [x] T1 — gentle-ai follows `main`. Route: delegated (single writer for T1–T3).
 - [x] T2 — Gentle Shell launcher installs from a resolved `main` commit and is
   left out of the blanket npm update. Route: delegated.
-- [ ] T3 — `gentle-rollback` records and restores the Gentle Shell commit.
+- [x] T3 — `gentle-rollback` records and restores the Gentle Shell commit.
   Route: delegated.
 
 Route evidence: T2 and T3 touch two non-trivial scripts plus both test files
@@ -115,5 +115,14 @@ Strategy: `ask-on-risk`. Forecast: about 200 authored changed lines, under the
   `bash scripts/linux/tests/gentle-update.test.sh` ends with `all cases passed`;
   `bash -n scripts/linux/gentle-update` is clean. The lookup runs under
   `timeout 60` with `GIT_TERMINAL_PROMPT=0` so an unattended run cannot hang.
+- T3 done in `c8d0fa5`. RED: 20 cases failed before the implementation (commit
+  not captured, no difference reported, restores exiting 3). GREEN:
+  `bash scripts/linux/tests/gentle-rollback.test.sh` ends with
+  `all cases passed` (146 ok); `bash scripts/linux/tests/gentle-update.test.sh`
+  ends with `all cases passed` (127 ok); `bash -n` is clean on both scripts.
+- A snapshot without a commit differs from a launcher that has one, and the
+  restore then reinstalls `gentle-pi@<version>` and removes the state file.
+  A commit file that is not a 40-hex id is treated as no commit.
+- `README.md` does not state which channel each tool tracks; left unchanged.
 
-Next step: T3.
+Next step: review and delivery (push and pull request are the user's call).
