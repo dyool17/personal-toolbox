@@ -140,8 +140,10 @@ Strategy: `ask-on-risk`. Forecast: about 200 authored changed lines, under the
     record, so in that state it reports `already at main commit` until main
     moves. Clearing the record before the reinstall would fail towards a
     reinstall.
-- Delivery: 550 changed lines is above the 400-line budget, mostly tests;
-  the slicing decision is pending with the user.
-
-Next step: the user decides on the two follow-ups and on delivery (merge,
-push, or pull request).
+- Follow-up fixed on user request (T4, inline route, one script plus its
+  test): `restore_launcher` drops the commit record before the reinstall and
+  writes it back only after success. RED: 2 cases failed (`a failing launcher
+  reinstall drops the recorded commit`, `a failing registry reinstall drops
+  the recorded commit`). GREEN: rollback suite `all cases passed`. With no
+  record, `install_gentle_shell` reinstalls, so its skip needed no change.
+- Delivery: the user chose a single merge of the branch into `main`.

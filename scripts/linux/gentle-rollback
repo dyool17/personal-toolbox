@@ -639,12 +639,15 @@ restore_packages() {
 
 # Reinstall the Gentle Shell launcher the way the snapshot recorded it: from
 # its commit when there is one, from the registry version otherwise (snapshots
-# taken before the launcher followed main). The recorded commit is then made
-# to match what is installed, and only after the install succeeded.
+# taken before the launcher followed main). The recorded commit is dropped
+# before the reinstall and written back only after it succeeded: a restore
+# that fails or is interrupted leaves no record, and gentle-update reinstalls
+# when there is none instead of trusting a commit that may not be installed.
 restore_launcher() {
   local commit version tmp
   [ -n "$(launcher_diff)" ] || return 0
   commit="$(commit_in "$SNAP/gentle-shell.commit")"
+  [ "$DRY_RUN" = 1 ] || rm -f "$GENTLE_SHELL_COMMIT_FILE"
 
   if [ -n "$commit" ]; then
     run npm install --global --allow-git=all "${GENTLE_SHELL_GIT_SPEC}#${commit}" || return 1
@@ -664,10 +667,8 @@ restore_launcher() {
   fi
 
   version="$(launcher_version "$SNAP")"
-  run npm install --global "$GENTLE_SHELL_NPM_PACKAGE@$version" || return 1
-  # The registry release has no commit; a stale record would make the next
-  # gentle-update believe main is already installed.
-  run rm -f "$GENTLE_SHELL_COMMIT_FILE"
+  # The registry release has no commit, so the record stays dropped.
+  run npm install --global "$GENTLE_SHELL_NPM_PACKAGE@$version"
 }
 
 # pi / gentle-shell: the npm global, then the home files. Files in the snapshot

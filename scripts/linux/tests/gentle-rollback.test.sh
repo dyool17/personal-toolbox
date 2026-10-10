@@ -357,7 +357,9 @@ check_not "--dry-run of a commit restore creates no hold" test -e "$GENTLE_UPDAT
 touch "$SANDBOX/fail-npm-install"
 rb restore "$IDC" --only gentle-shell --yes >/dev/null 2>&1
 check_eq "a failing launcher reinstall fails the restore" "1" "$?"
-check_eq "a failing launcher reinstall keeps the recorded commit" "$SHA_B" "$(cat "$(commit_file)")"
+# The record is dropped before the reinstall: once npm has started, nothing
+# proves which launcher is installed, and no record makes gentle-update reinstall.
+check_not "a failing launcher reinstall drops the recorded commit" test -e "$(commit_file)"
 check_not "a failing launcher reinstall is not held" test -e "$GENTLE_UPDATE_STATE_DIR/holds/gentle-shell"
 rm -f "$SANDBOX/fail-npm-install"
 
@@ -388,6 +390,14 @@ check "--dry-run prints the registry install" grep -qF 'npm install --global gen
 check_not "--dry-run of a registry restore runs no npm install" grep -q '^npm install' "$STUB_LOG"
 check_eq "--dry-run of a registry restore keeps the recorded commit" "$SHA_B" "$(cat "$(commit_file)")"
 
+touch "$SANDBOX/fail-npm-install"
+rb restore "$IDO" --only gentle-shell --yes >/dev/null 2>&1
+check_eq "a failing registry reinstall fails the restore" "1" "$?"
+check_not "a failing registry reinstall drops the recorded commit" test -e "$(commit_file)"
+rm -f "$SANDBOX/fail-npm-install"
+echo "$SHA_B" > "$(commit_file)"
+
+: > "$STUB_LOG"
 rb restore "$IDO" --only gentle-shell --yes >/dev/null 2>&1
 check_eq "a registry restore exits 0" "0" "$?"
 check "the launcher is reinstalled at the snapshot registry version" grep -qx 'npm install --global gentle-pi@4.0.0' "$STUB_LOG"
