@@ -73,6 +73,7 @@ if [ "$name" = pnpm ]; then
 fi
 case "$name $*" in
   "npm ls -g --depth=0 --json")  cat "$SANDBOX/npm-globals.json" ;;
+  "npm install --global "*)      if [ -e "$SANDBOX/fail-npm-install" ]; then exit 1; fi ;;
   "pnpm ls -g --depth=0 --json") cat "$SANDBOX/pnpm-globals.json" ;;
   *" --version")                 cat "$SANDBOX/versions/$name" ;;
 esac
@@ -89,12 +90,12 @@ echo "1.0.3"                            > "$SANDBOX/versions/pi"
 echo "gentle-shell 4.0.0"               > "$SANDBOX/versions/gentle-shell"
 echo "codex-cli 0.160.0"                > "$SANDBOX/versions/codex"
 
-# write_npm_globals <left-pad version> <codex version>
+# write_npm_globals <left-pad version> <codex version> [gentle-pi version]
 write_npm_globals() {
   cat > "$SANDBOX/npm-globals.json" <<EOF
 {"name": "lib", "dependencies": {
   "@earendil-works/pi-coding-agent": {"version": "1.0.3"},
-  "gentle-pi": {"version": "4.0.0"},
+  "gentle-pi": {"version": "${3:-4.0.0}"},
   "@openai/codex": {"version": "$2"},
   "left-pad": {"version": "$1"}
 }}
@@ -317,6 +318,100 @@ check_eq "home restore never touches auth.json" '{"secret": "rotated"}' "$(cat "
 check "restored lockfile triggers npm ci in the home" grep -qx "npm ci --prefix $PI_CODING_AGENT_DIR/npm" "$STUB_LOG"
 check_eq "no auth.json in any snapshot" "" "$(find "$SANDBOX"/state* -name auth.json 2>/dev/null)"
 check_not "restored home no longer differs" grep -qE '^  pi .*differs' <<<"$(rb show "$(rb list 2>/dev/null | tail -1 | cut -d' ' -f1)" 2>&1)"
+
+# --- Gentle Shell launcher commit --------------------------------------------
+
+# gentle-update installs the launcher from a main commit and records it in the
+# state directory; npm reports the same version for every commit.
+SHA_A="1111111111111111111111111111111111111111"
+SHA_B="2222222222222222222222222222222222222222"
+INSTALL_BY_COMMIT="npm install --global --allow-git=all github:Gentleman-Programming/gentle-shell#"
+commit_file() { printf '%s\n' "$GENTLE_UPDATE_STATE_DIR/gentle-shell.commit"; }
+
+fresh_state shell-commit
+mkdir -p "$GENTLE_UPDATE_STATE_DIR"
+echo "$SHA_A" > "$(commit_file)"
+IDC="$(rb snapshot --reason commit-a 2>/dev/null)"
+SNAPC="$GENTLE_UPDATE_STATE_DIR/snapshots/$IDC"
+check_eq "the snapshot records the launcher commit" "$SHA_A" "$(cat "$SNAPC/gentle-shell.commit" 2>/dev/null)"
+SHOW="$(rb show "$IDC" 2>&1)"
+check "show prints the short commit of an unchanged launcher" grep -qE "^  gentle-shell +same .*${SHA_A:0:12}" <<<"$SHOW"
+check_not "show never prints the full commit" grep -qF "$SHA_A" <<<"$SHOW"
+
+echo "$SHA_B" > "$(commit_file)"
+SHOW="$(rb show "$IDC" 2>&1)"
+check "a different commit differs even at the same npm version" grep -qE '^  gentle-shell .*differs' <<<"$SHOW"
+check "the difference names both short commits" grep -qE "gentle-pi 4\.0\.0 \(commit ${SHA_B:0:12}\) -> 4\.0\.0 \(commit ${SHA_A:0:12}\)" <<<"$SHOW"
+check "list counts the launcher commit as a difference" grep -qE "^$IDC +commit-a +1 differ" <<<"$(rb list 2>&1)"
+
+: > "$STUB_LOG"
+OUT="$(rb restore "$IDC" --only gentle-shell --dry-run 2>&1)"
+check_eq "--dry-run of a commit restore exits 0" "0" "$?"
+check "--dry-run prints the install by commit" grep -qF "$INSTALL_BY_COMMIT$SHA_A" <<<"$OUT"
+check "--dry-run prints that the commit would be recorded" grep -qE "would record:.* commit $SHA_A in $(commit_file)" <<<"$OUT"
+check_not "--dry-run runs no npm install" grep -q '^npm install' "$STUB_LOG"
+check_eq "--dry-run leaves the recorded commit alone" "$SHA_B" "$(cat "$(commit_file)")"
+check_eq "--dry-run of a commit restore takes no snapshot" "1" "$(snapshot_count)"
+check_not "--dry-run of a commit restore creates no hold" test -e "$GENTLE_UPDATE_STATE_DIR/holds/gentle-shell"
+
+touch "$SANDBOX/fail-npm-install"
+rb restore "$IDC" --only gentle-shell --yes >/dev/null 2>&1
+check_eq "a failing launcher reinstall fails the restore" "1" "$?"
+check_eq "a failing launcher reinstall keeps the recorded commit" "$SHA_B" "$(cat "$(commit_file)")"
+check_not "a failing launcher reinstall is not held" test -e "$GENTLE_UPDATE_STATE_DIR/holds/gentle-shell"
+rm -f "$SANDBOX/fail-npm-install"
+
+: > "$STUB_LOG"
+rb restore "$IDC" --only gentle-shell --yes >/dev/null 2>&1
+check_eq "a commit restore exits 0" "0" "$?"
+check "the launcher is reinstalled at the snapshot commit" grep -qxF "$INSTALL_BY_COMMIT$SHA_A" "$STUB_LOG"
+check_not "a commit restore does not install the registry release" grep -q 'gentle-pi@' "$STUB_LOG"
+check_not "an unchanged home needs no npm ci" grep -q '^npm ci' "$STUB_LOG"
+check_eq "the restored commit is recorded" "$SHA_A" "$(cat "$(commit_file)")"
+check "a commit restore holds gentle-shell" test -e "$GENTLE_UPDATE_STATE_DIR/holds/gentle-shell"
+check "the pre-rollback snapshot kept the replaced commit" grep -rqxF "$SHA_B" "$GENTLE_UPDATE_STATE_DIR/snapshots" --include=gentle-shell.commit
+rb restore "$IDC" --only gentle-shell --yes >/dev/null 2>&1
+check_eq "a restored commit no longer differs (exit 3)" "3" "$?"
+
+# A snapshot without a commit (taken before the launcher followed main, or
+# before its first install from git) restores through the registry version.
+fresh_state shell-registry
+IDO="$(rb snapshot --reason registry 2>/dev/null)"
+check_not "a snapshot without a recorded commit stores none" test -e "$GENTLE_UPDATE_STATE_DIR/snapshots/$IDO/gentle-shell.commit"
+check_not "a snapshot without a commit prints none" grep -qE '^  gentle-shell .*commit' <<<"$(rb show "$IDO" 2>&1)"
+echo "$SHA_B" > "$(commit_file)"
+check "a commit installed after a registry snapshot differs" grep -qE "^  gentle-shell .*differs.* gentle-pi 4\.0\.0 \(commit ${SHA_B:0:12}\) -> 4\.0\.0\$" <<<"$(rb show "$IDO" 2>&1)"
+
+: > "$STUB_LOG"
+OUT="$(rb restore "$IDO" --only gentle-shell --dry-run 2>&1)"
+check "--dry-run prints the registry install" grep -qF 'npm install --global gentle-pi@4.0.0' <<<"$OUT"
+check_not "--dry-run of a registry restore runs no npm install" grep -q '^npm install' "$STUB_LOG"
+check_eq "--dry-run of a registry restore keeps the recorded commit" "$SHA_B" "$(cat "$(commit_file)")"
+
+rb restore "$IDO" --only gentle-shell --yes >/dev/null 2>&1
+check_eq "a registry restore exits 0" "0" "$?"
+check "the launcher is reinstalled at the snapshot registry version" grep -qx 'npm install --global gentle-pi@4.0.0' "$STUB_LOG"
+check_not "a registry restore does not install from git" grep -q -- '--allow-git' "$STUB_LOG"
+check_not "a registry restore removes the recorded commit" test -e "$(commit_file)"
+
+# No commit on either side: only the npm version can differ, as before.
+fresh_state shell-version
+IDV="$(rb snapshot 2>/dev/null)"
+write_npm_globals 1.0.0 0.160.0 4.1.0
+: > "$STUB_LOG"
+check "a moved registry version differs" grep -qE '^  gentle-shell .*differs.* gentle-pi 4\.1\.0 -> 4\.0\.0$' <<<"$(rb show "$IDV" 2>&1)"
+rb restore "$IDV" --only gentle-shell --yes >/dev/null 2>&1
+check "a moved registry version is reinstalled at the snapshot version" grep -qx 'npm install --global gentle-pi@4.0.0' "$STUB_LOG"
+check_not "a version restore records no commit" test -e "$(commit_file)"
+write_npm_globals 1.0.0 0.160.0
+
+# Only a full commit id is worth recording.
+fresh_state shell-garbage
+mkdir -p "$GENTLE_UPDATE_STATE_DIR"
+echo "not-a-commit" > "$(commit_file)"
+IDG="$(rb snapshot 2>/dev/null)"
+check_not "a malformed commit file is not copied into the snapshot" test -e "$GENTLE_UPDATE_STATE_DIR/snapshots/$IDG/gentle-shell.commit"
+check_not "a malformed commit file does not count as a difference" grep -qE '^  gentle-shell .*differs' <<<"$(rb show "$IDG" 2>&1)"
 
 # --- Claude plugins ----------------------------------------------------------
 

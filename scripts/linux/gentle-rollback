@@ -15,6 +15,9 @@
 #                             installer pinned to that version.
 #   pi gentle-shell           The npm global version plus a whitelist of files
 #                             from the Pi home (settings, extensions, lockfile).
+#                             gentle-shell also records the git commit its
+#                             launcher was installed from, because npm reports
+#                             the same version for every commit of a branch.
 #   codex npm-globals         npm global versions.
 #   pnpm-globals              pnpm global versions.
 #   claude-plugins            installed_plugins.json.
@@ -33,6 +36,8 @@
 #   snapshots/<id>/   one directory per snapshot
 #   store/<sha256>    binaries, shared between snapshots
 #   holds/<component> one file per held component
+#   gentle-shell.commit  commit the Gentle Shell launcher is installed from,
+#                        written by gentle-update and by a restore
 #   lock              flock shared with gentle-update
 #
 # Usage:
@@ -84,6 +89,11 @@ CREDENTIAL_EXCLUDES=(--exclude=auth.json --exclude='*.token' --exclude=.env
 PI_NPM_PACKAGE="@earendil-works/pi-coding-agent"
 # The npm package name remains gentle-pi; it installs the gentle-shell command.
 GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
+# gentle-update installs the launcher from a commit of this repository and
+# records that commit here. npm does not record it, so this file is the only
+# way to tell two installs of the same version apart.
+GENTLE_SHELL_GIT_SPEC="github:Gentleman-Programming/gentle-shell"
+GENTLE_SHELL_COMMIT_FILE="$STATE/gentle-shell.commit"
 CODEX_NPM_PACKAGE="@openai/codex"
 
 DRY_RUN=0
@@ -238,6 +248,49 @@ pkg_changes() {
   done < <(pkg_table "$kind" "$SNAP")
 }
 
+# The launcher commit recorded in <file>, or nothing when the file is missing
+# or does not hold a full commit id. A snapshot taken before the launcher
+# followed main has no such file.
+commit_in() {
+  local sha=""
+  [ -f "$1" ] || return 0
+  IFS= read -r sha < "$1" || true
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] && printf '%s\n' "$sha"
+  return 0
+}
+
+# Version of the launcher's npm package as <dir> recorded it.
+launcher_version() {
+  pkg_table npm "$1" | awk -F'\t' -v p="$GENTLE_SHELL_NPM_PACKAGE" '$1 == p { print $2; exit }'
+}
+
+# "version" or "version (commit <short>)" for the launcher diff line.
+launcher_label() {
+  if [ -n "$2" ]; then
+    printf '%s (commit %s)\n' "${1:--}" "${2:0:12}"
+  else
+    printf '%s\n' "${1:--}"
+  fi
+}
+
+# One "package current -> snapshot" line when the Gentle Shell launcher differs
+# from the snapshot, in its npm version or in the commit it was installed
+# from. A launcher the snapshot did not record at all never differs: a restore
+# never uninstalls.
+launcher_diff() {
+  local want_version have_version want_commit have_commit
+  want_version="$(launcher_version "$SNAP")"
+  have_version="$(launcher_version "$CUR")"
+  want_commit="$(commit_in "$SNAP/gentle-shell.commit")"
+  have_commit="$(commit_in "$CUR/gentle-shell.commit")"
+
+  if [ -z "$want_version" ] && [ -z "$want_commit" ]; then return 0; fi
+  if [ "$want_version" = "$have_version" ] && [ "$want_commit" = "$have_commit" ]; then return 0; fi
+  printf '%s %s -> %s\n' "$GENTLE_SHELL_NPM_PACKAGE" \
+    "$(launcher_label "$have_version" "$have_commit")" \
+    "$(launcher_label "$want_version" "$want_commit")"
+}
+
 # Relative paths of the snapshot's home files that are missing or different in
 # the live home. Files that only exist in the live home never count.
 home_diff() {
@@ -275,9 +328,13 @@ comp_diff() {
       [ "$want" = "$have" ] || printf '%s -> %s\n' "${have:--}" "$want"
       ;;
     pi|gentle-shell)
-      while IFS=$'\t' read -r pkg have want; do
-        [ -n "$pkg" ] && printf '%s %s -> %s\n' "$pkg" "$have" "$want"
-      done < <(pkg_changes "$comp")
+      if [ "$comp" = gentle-shell ]; then
+        launcher_diff
+      else
+        while IFS=$'\t' read -r pkg have want; do
+          [ -n "$pkg" ] && printf '%s %s -> %s\n' "$pkg" "$have" "$want"
+        done < <(pkg_changes "$comp")
+      fi
       while IFS= read -r rel; do
         [ -n "$rel" ] && printf 'home file %s\n' "$rel"
       done < <(home_diff "$comp")
@@ -297,7 +354,7 @@ comp_diff() {
 
 # Short description of one component as the snapshot recorded it.
 comp_state() {
-  local comp="$1" sha
+  local comp="$1" sha commit
   case "$comp" in
     gentle-ai|engram|herdr|moshi-hook)
       sha="$(tsv_get "$SNAP/binaries.tsv" "$comp")"
@@ -312,7 +369,13 @@ comp_state() {
     pi)
       printf '%s, home files\n' "$(tsv_get "$SNAP/versions.tsv" pi)" ;;
     gentle-shell)
-      printf '%s, home files\n' "$(tsv_get "$SNAP/versions.tsv" gentle-shell)" ;;
+      commit="$(commit_in "$SNAP/gentle-shell.commit")"
+      if [ -n "$commit" ]; then
+        printf '%s, commit %s, home files\n' "$(tsv_get "$SNAP/versions.tsv" gentle-shell)" "${commit:0:12}"
+      else
+        printf '%s, home files\n' "$(tsv_get "$SNAP/versions.tsv" gentle-shell)"
+      fi
+      ;;
     codex)
       tsv_get "$SNAP/versions.tsv" codex ;;
     npm-globals)
@@ -332,11 +395,19 @@ comp_state() {
 # --- capturing a state -------------------------------------------------------
 
 # Write the cheap, comparable part of the machine state into <dir>: versions,
-# binary checksums, and package lists. With <store>=1 the binaries themselves
-# are also saved into the content-addressed store.
+# binary checksums, package lists, and the Gentle Shell launcher commit. With
+# <store>=1 the binaries themselves are also saved into the content-addressed
+# store.
 capture_state() {
   local dir="$1" store="${2:-0}" tool sha tmp
   mkdir -p "$dir" || return 1
+
+  # Copied only when it holds a full commit id; anything else is treated like
+  # a launcher with no recorded commit.
+  sha="$(commit_in "$GENTLE_SHELL_COMMIT_FILE")"
+  if [ -n "$sha" ]; then
+    printf '%s\n' "$sha" > "$dir/gentle-shell.commit" || return 1
+  fi
 
   for tool in "${VERSIONED[@]}"; do
     printf '%s\t%s\n' "$tool" "$(tool_version "$tool")"
@@ -566,12 +637,49 @@ restore_packages() {
   return $status
 }
 
+# Reinstall the Gentle Shell launcher the way the snapshot recorded it: from
+# its commit when there is one, from the registry version otherwise (snapshots
+# taken before the launcher followed main). The recorded commit is then made
+# to match what is installed, and only after the install succeeded.
+restore_launcher() {
+  local commit version tmp
+  [ -n "$(launcher_diff)" ] || return 0
+  commit="$(commit_in "$SNAP/gentle-shell.commit")"
+
+  if [ -n "$commit" ]; then
+    run npm install --global --allow-git=all "${GENTLE_SHELL_GIT_SPEC}#${commit}" || return 1
+    if [ "$DRY_RUN" = 1 ]; then
+      printf '  \033[2mwould record:\033[0m commit %s in %s\n' "$commit" "$GENTLE_SHELL_COMMIT_FILE"
+      return 0
+    fi
+    # Written under a temporary name so an interrupted write never leaves
+    # half a commit.
+    tmp="$GENTLE_SHELL_COMMIT_FILE.$$"
+    if ! { printf '%s\n' "$commit" > "$tmp" && mv -f "$tmp" "$GENTLE_SHELL_COMMIT_FILE"; }; then
+      rm -f "$tmp"
+      warn "gentle-shell — reinstalled at $commit but the commit could not be recorded"
+      return 1
+    fi
+    return 0
+  fi
+
+  version="$(launcher_version "$SNAP")"
+  run npm install --global "$GENTLE_SHELL_NPM_PACKAGE@$version" || return 1
+  # The registry release has no commit; a stale record would make the next
+  # gentle-update believe main is already installed.
+  run rm -f "$GENTLE_SHELL_COMMIT_FILE"
+}
+
 # pi / gentle-shell: the npm global, then the home files. Files in the snapshot
 # overwrite the live ones; files that are not in the snapshot are left alone.
 restore_pi_home() {
   local comp="$1" home changed status=0
   home="$(home_of "$comp")"
-  restore_packages "$comp" || status=1
+  if [ "$comp" = gentle-shell ]; then
+    restore_launcher || status=1
+  else
+    restore_packages "$comp" || status=1
+  fi
 
   changed="$(home_diff "$comp")"
   if [ -n "$changed" ]; then
