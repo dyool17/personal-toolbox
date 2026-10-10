@@ -104,7 +104,17 @@ case "$name $*" in
   "claude update")              if [ -e "$SANDBOX/break-claude" ]; then touch "$SANDBOX/claude-broken"; fi ;;
   "claude --version")           [ -e "$SANDBOX/claude-broken" ] && exit 1; echo "2.1.289 (Claude Code)" ;;
   "go env GOPATH")              echo "$SANDBOX/gopath" ;;
-  "moshi-hook doctor --json")   cat "$SANDBOX/doctor.json" ;;
+  "moshi-hook doctor --json")
+    # A restarted daemon reports features as down until it is back up: one
+    # warming-up answer per line left in doctor-warming.
+    if [ -e "$SANDBOX/moshi-restarted" ] && [ -s "$SANDBOX/doctor-warming" ]; then
+      sed -i 1d "$SANDBOX/doctor-warming"
+      cat "$SANDBOX/doctor-warming.json"
+    else
+      cat "$SANDBOX/doctor.json"
+    fi
+    ;;
+  "moshi-hook service restart") touch "$SANDBOX/moshi-restarted" ;;
   "moshi-hook update")
     # A real update replaces the binary; do the same when the test asks for it.
     if [ -e "$SANDBOX/moshi-new-build" ]; then
@@ -159,7 +169,8 @@ reset() {
     "$SANDBOX/moshi-new-build" "$SANDBOX/doctor-after.json" "$GENTLE_UPDATE_STATE_DIR"/holds/* \
     "$SANDBOX/restore-rc" "$SANDBOX/restore-does-not-fix" "$SANDBOX/fail-npm-ls" \
     "$SANDBOX/fail-mise-env" "$SANDBOX/empty-mise-env" "$SANDBOX/fail-npm-install" \
-    "$SANDBOX/fail-git-ls-remote" "$SHELL_COMMIT_FILE"
+    "$SANDBOX/fail-git-ls-remote" "$SHELL_COMMIT_FILE" \
+    "$SANDBOX/moshi-restarted" "$SANDBOX/doctor-warming"
   write_npm_globals
   write_ls_remote "$SHELL_SHA"
   printf '%s\n' "$DOCTOR_OK" > "$SANDBOX/doctor.json"
@@ -301,6 +312,24 @@ printf '%s\n' "$DOCTOR_REGRESSED" > "$SANDBOX/doctor-after.json"
 run_update packages
 check_eq "a feature that stopped being ok fails the run" "1" "$RC"
 check "the regressed feature is named" grep -q 'sessions' <<<"$OUT"
+check_eq "without a restart doctor is not asked again" "2" "$(grep -cxF 'moshi-hook doctor --json' "$STUB_LOG")"
+
+# A daemon that was just restarted needs a moment before doctor sees it whole.
+printf '%s\n' "$DOCTOR_REGRESSED" > "$SANDBOX/doctor-warming.json"
+reset
+touch "$SANDBOX/moshi-new-build"
+printf 'warming\n' > "$SANDBOX/doctor-warming"
+GENTLE_UPDATE_MOSHI_READY_SECS=3 run_update packages
+check_eq "a daemon still starting up does not fail the run" "0" "$RC"
+check_not "a feature that came back is not reported" grep -q 'no longer ok' <<<"$OUT"
+check_eq "doctor is asked again after the restart" "3" "$(grep -cxF 'moshi-hook doctor --json' "$STUB_LOG")"
+
+reset
+touch "$SANDBOX/moshi-new-build"
+printf '%s\n' "$DOCTOR_REGRESSED" > "$SANDBOX/doctor-after.json"
+GENTLE_UPDATE_MOSHI_READY_SECS=1 run_update packages
+check_eq "a feature still down after the wait fails the run" "1" "$RC"
+check "the feature still down after the wait is named" grep -q 'sessions' <<<"$OUT"
 
 # --- holds -------------------------------------------------------------------
 

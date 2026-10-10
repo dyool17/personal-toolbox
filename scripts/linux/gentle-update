@@ -375,6 +375,8 @@ moshi_ok_features() {
 # asking, which would install hooks and change host settings nobody chose.
 update_moshi_hook() {
   local bin before_sha after_sha before_doc after_doc ready agent home regressed status=0
+  local restarted=0 waited=0 ready_secs="${GENTLE_UPDATE_MOSHI_READY_SECS:-30}"
+  [[ "$ready_secs" =~ ^[0-9]+$ ]] || ready_secs=30
   bin="$(command -v moshi-hook)" || return 1
   before_sha="$(sha256sum "$bin" | cut -d' ' -f1)"
   before_doc="$(moshi-hook doctor --json 2>/dev/null </dev/null)"
@@ -406,12 +408,21 @@ update_moshi_hook() {
   after_sha="$(sha256sum "$bin" | cut -d' ' -f1)"
   if [ "$before_sha" != "$after_sha" ]; then
     moshi-hook service restart || status=1
+    restarted=1
   else
     printf '  moshi-hook binary unchanged; daemon left running\n'
   fi
 
-  after_doc="$(moshi-hook doctor --json 2>/dev/null </dev/null)"
-  regressed="$(comm -23 <(moshi_ok_features "$before_doc") <(moshi_ok_features "$after_doc") | paste -sd, -)"
+  # A daemon that was just restarted reports most features as down until it
+  # has reconnected, which takes about a second. Ask again for a while before
+  # calling that a regression; without a restart the first answer stands.
+  while :; do
+    after_doc="$(moshi-hook doctor --json 2>/dev/null </dev/null)"
+    regressed="$(comm -23 <(moshi_ok_features "$before_doc") <(moshi_ok_features "$after_doc") | paste -sd, -)"
+    [ -n "$regressed" ] && [ "$restarted" = 1 ] && [ "$waited" -lt "$ready_secs" ] || break
+    sleep 1
+    waited=$((waited + 1))
+  done
   if [ -n "$regressed" ]; then
     warn "moshi-hook doctor: no longer ok after the update: $regressed"
     status=1
