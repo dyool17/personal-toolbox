@@ -5,9 +5,11 @@
 #
 #   agents     AI coding agents and their runtimes -> latest stable.
 #              Claude Code, Codex, OpenCode, Pi runtime, Gentle Shell, herdr.
-#   toolchain  Gentleman tools -> latest official release (never main).
-#              gentle-ai and engram; the standalone Gentle Shell home is
-#              provisioned by its launcher instead of syncing the regular Pi home.
+#   toolchain  Gentleman tools, each on its own channel.
+#              gentle-ai is built from the tip of main; engram from its latest
+#              official release (never main). The standalone Gentle Shell home
+#              is provisioned by its launcher instead of syncing the regular
+#              Pi home.
 #   plugins    Claude Code marketplaces and installed plugins.
 #   packages   Global package managers and standalone binaries.
 #              npm globals, pnpm globals, moshi-hook, mise itself.
@@ -49,9 +51,11 @@ BIN_DIR="${GENTLE_UPDATE_BIN_DIR:-$HOME/.local/bin}"
 # State shared with gentle-rollback: snapshots, holds, and the lock.
 STATE="${GENTLE_UPDATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gentle-update}"
 # Module paths carry the major version and change on every major release:
-# when a new major ships, bump /v4 and /v3 here. `@latest` resolves to the
+# when a new major ships, bump /v4 and /v3 here. The suffix is the channel:
+# gentle-ai follows `@main`, the tip of the main branch, to pick up fixes
+# before they are released; engram follows `@latest`, which resolves to the
 # newest tagged release and never to a prerelease or main.
-GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@latest"
+GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@main"
 ENGRAM_PKG="github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 # The npm package name remains gentle-pi; it installs the gentle-shell command.
 GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
@@ -127,10 +131,11 @@ report_versions() {
 
 # --- toolchain ---------------------------------------------------------------
 
-# Build a Go binary from a release into BIN_DIR. The previous build is not
-# copied aside here: the pre-update snapshot already holds it, and
-# `gentle-rollback restore --only <name>` brings it back.
-install_release() {
+# Build a Go binary into BIN_DIR from the module version its package path
+# names (a release for `@latest`, the branch tip for `@main`). The previous
+# build is not copied aside here: the pre-update snapshot already holds it,
+# and `gentle-rollback restore --only <name>` brings it back.
+install_go_binary() {
   local name="$1" pkg="$2"
 
   # A throwaway working directory keeps the build out of any local Go module.
@@ -590,9 +595,9 @@ if wants agents; then
 fi
 
 if wants toolchain; then
-  heading "Gentleman toolchain (latest release)"
-  step gentle-ai "gentle-ai" go install_release gentle-ai "$GENTLE_AI_PKG"
-  step engram    "engram"    go install_release engram    "$ENGRAM_PKG"
+  heading "Gentleman toolchain (gentle-ai: main, engram: latest release)"
+  step gentle-ai "gentle-ai" go install_go_binary gentle-ai "$GENTLE_AI_PKG"
+  step engram    "engram"    go install_go_binary engram    "$ENGRAM_PKG"
   sync_gentle_ai_dev_override
 fi
 

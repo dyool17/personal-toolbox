@@ -188,6 +188,15 @@ check_not "doctor is never run with --yes" grep -qE 'doctor.*--yes' "$STUB_LOG"
 check_not "no .prev backup is written" test -e "$GENTLE_UPDATE_BIN_DIR/gentle-ai.prev"
 check_not "runtimes stay out of 'all'" logged "mise upgrade --yes"
 
+# --- toolchain channels ------------------------------------------------------
+
+reset
+run_update toolchain
+check_eq "a clean toolchain run exits 0" "0" "$RC"
+check "gentle-ai is built from main" logged "go install github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@main"
+check "engram is built from its latest release" logged "go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
+check_eq "the toolchain builds exactly two Go binaries" "2" "$(grep -c '^go install ' "$STUB_LOG")"
+
 # --- Moshi -------------------------------------------------------------------
 
 reset
