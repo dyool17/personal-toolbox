@@ -5,6 +5,8 @@
 #
 #   agents     AI coding agents and their runtimes -> latest stable.
 #              Claude Code, Codex, OpenCode, Pi runtime, Gentle Shell, herdr.
+#              The Gentle Shell launcher is the exception: it is installed
+#              from the tip of its main branch, pinned to the resolved commit.
 #   toolchain  Gentleman tools, each on its own channel.
 #              gentle-ai is built from the tip of main; engram from its latest
 #              official release (never main). The standalone Gentle Shell home
@@ -16,6 +18,8 @@
 #   runtimes   Language runtimes managed by mise. NOT part of `all` — see below.
 #
 # The standalone launcher is updated before its isolated home is provisioned.
+# When the main commit cannot be resolved the launcher is left as it is and the
+# step is reported as failed.
 # The PATH Pi runtime is updated separately; Gentle Shell does not update Pi itself.
 #
 # `runtimes` is opt-in on purpose. mise installs each runtime into its own
@@ -59,6 +63,13 @@ GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@main"
 ENGRAM_PKG="github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 # The npm package name remains gentle-pi; it installs the gentle-shell command.
 GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
+# The launcher is installed from the main branch of its repository instead of
+# the registry release. npm does not record the commit of a git-installed
+# global, so the installed commit is kept in the state directory, where
+# gentle-rollback reads it.
+GENTLE_SHELL_REPO_URL="https://github.com/Gentleman-Programming/gentle-shell"
+GENTLE_SHELL_GIT_SPEC="github:Gentleman-Programming/gentle-shell"
+GENTLE_SHELL_COMMIT_FILE="$STATE/gentle-shell.commit"
 PI_NPM_PACKAGE="@earendil-works/pi-coding-agent"
 CODEX_NPM_PACKAGE="@openai/codex"
 PNPM_GLOBAL_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
@@ -179,9 +190,48 @@ sync_gentle_ai_dev_override() {
   ok "repaired gentle-pi dev binary override -> $target"
 }
 
+# Print the commit the Gentle Shell main branch points at. Anything that is
+# not exactly one full commit id (no output, an error page, a failed lookup)
+# is a failure: the caller must never install or record a guess.
+resolve_gentle_shell_commit() {
+  local listing sha
+  # No credential prompt: an unattended run has nobody to answer it.
+  listing="$(GIT_TERMINAL_PROMPT=0 timeout 60 \
+    git ls-remote "$GENTLE_SHELL_REPO_URL" refs/heads/main </dev/null)" || return 1
+  sha="$(awk 'NR == 1 { print $1 }' <<<"$listing")"
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s\n' "$sha"
+}
+
+# Install the launcher from the commit main points at right now. Installing by
+# commit rather than by branch name makes the recorded commit exactly what was
+# installed, which is what gentle-rollback restores.
 install_gentle_shell() {
-  npm install --global "${GENTLE_SHELL_NPM_PACKAGE}@latest" || return 1
+  local sha recorded="" tmp
+  if ! sha="$(resolve_gentle_shell_commit)"; then
+    warn "could not resolve the main commit of $GENTLE_SHELL_REPO_URL; the launcher was left as it is"
+    return 1
+  fi
+
+  [ -f "$GENTLE_SHELL_COMMIT_FILE" ] && recorded="$(head -1 "$GENTLE_SHELL_COMMIT_FILE" 2>/dev/null)"
+  if [ "$recorded" = "$sha" ] && command -v gentle-shell >/dev/null 2>&1; then
+    printf '  already at main commit %s\n' "${sha:0:12}"
+    return 0
+  fi
+
+  # npm refuses git packages unless they are allowed explicitly.
+  npm install --global --allow-git=all "${GENTLE_SHELL_GIT_SPEC}#${sha}" || return 1
   hash -r 2>/dev/null || true
+
+  # Recorded only now, so a failed install never claims a commit. Written
+  # under a temporary name so an interrupted write never leaves half a commit.
+  tmp="$GENTLE_SHELL_COMMIT_FILE.$$"
+  if ! { printf '%s\n' "$sha" > "$tmp" && mv -f "$tmp" "$GENTLE_SHELL_COMMIT_FILE"; }; then
+    rm -f "$tmp"
+    warn "the launcher was installed at $sha but the commit could not be recorded"
+    return 1
+  fi
+  printf '  installed main commit %s\n' "${sha:0:12}"
 }
 
 # --- agents ------------------------------------------------------------------
@@ -249,6 +299,10 @@ npm_component() {
 
 # A blanket `npm update -g` would also bump packages whose component is held,
 # so the packages are named one by one and the held ones are left out.
+#
+# The Gentle Shell launcher is left out as well, held or not: it is installed
+# from git by its own step, and `npm update` would move it back to the
+# registry release.
 update_npm_globals() {
   local listing names pkg pkgs=()
   # A listing that does not parse is not an empty listing: fail the step
@@ -270,6 +324,10 @@ update_npm_globals() {
 
   while read -r pkg; do
     [ -n "$pkg" ] || continue
+    if [ "$pkg" = "$GENTLE_SHELL_NPM_PACKAGE" ]; then
+      printf '  leaving %s alone (installed from git by the launcher step)\n' "$pkg"
+      continue
+    fi
     if held "$(npm_component "$pkg")"; then
       printf '  leaving %s alone (held)\n' "$pkg"
       continue
@@ -569,7 +627,7 @@ fi
 
 if wants agents || wants toolchain || wants packages; then
   heading "Gentle Shell standalone launcher"
-  step gentle-shell "Gentle Shell launcher (npm:${GENTLE_SHELL_NPM_PACKAGE})" npm install_gentle_shell
+  step gentle-shell "Gentle Shell launcher (gentle-shell main)" npm install_gentle_shell
 fi
 
 if wants agents || wants toolchain; then

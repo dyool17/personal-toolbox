@@ -88,6 +88,14 @@ case "$name $*" in
     [ -e "$SANDBOX/fail-npm-ls" ] && exit 1
     cat "$SANDBOX/npm-globals.json"
     ;;
+  "npm install --global "*)
+    [ -e "$SANDBOX/fail-npm-install" ] && exit 1
+    ;;
+  "git ls-remote "*)
+    # Canned answer for the Gentle Shell main branch; never reaches the network.
+    [ -e "$SANDBOX/fail-git-ls-remote" ] && exit 128
+    cat "$SANDBOX/ls-remote.out"
+    ;;
   "mise env -s bash")
     if [ -e "$SANDBOX/fail-mise-env" ]; then echo "mise: config error" >&2; exit 1; fi
     if [ ! -e "$SANDBOX/empty-mise-env" ]; then echo "export GENTLE_TEST_MISE_ENV=1"; fi
@@ -108,7 +116,7 @@ case "$name $*" in
 esac
 exit 0
 EOF
-for tool in npm pnpm claude codex opencode pi gentle-shell herdr mise go; do
+for tool in npm pnpm claude codex opencode pi gentle-shell herdr mise go git; do
   install -m 755 "$SANDBOX/stub" "$STUBS/$tool"
 done
 install_bin_dir() {
@@ -131,6 +139,15 @@ write_npm_globals() {
 JSON
 }
 
+# The commit `git ls-remote` reports for the Gentle Shell main branch, the
+# file gentle-update records it in, and the commands the launcher step runs.
+SHELL_SHA="1111111111111111111111111111111111111111"
+SHELL_SHA_OLD="2222222222222222222222222222222222222222"
+SHELL_COMMIT_FILE="$GENTLE_UPDATE_STATE_DIR/gentle-shell.commit"
+SHELL_LS_REMOTE="git ls-remote https://github.com/Gentleman-Programming/gentle-shell refs/heads/main"
+SHELL_INSTALL="npm install --global --allow-git=all github:Gentleman-Programming/gentle-shell#"
+write_ls_remote() { printf '%s\trefs/heads/main\n' "$1" > "$SANDBOX/ls-remote.out"; }
+
 DOCTOR_OK='{"features": [{"id": "inbox", "status": "ok", "readyAgents": ["claude", "pi"]}, {"id": "sessions", "status": "ok", "readyAgents": null}]}'
 DOCTOR_REGRESSED='{"features": [{"id": "inbox", "status": "ok", "readyAgents": ["claude", "pi"]}, {"id": "sessions", "status": "error", "readyAgents": null}]}'
 
@@ -141,8 +158,10 @@ reset() {
   rm -f "$SANDBOX/fail-snapshot" "$SANDBOX/break-claude" "$SANDBOX/claude-broken" \
     "$SANDBOX/moshi-new-build" "$SANDBOX/doctor-after.json" "$GENTLE_UPDATE_STATE_DIR"/holds/* \
     "$SANDBOX/restore-rc" "$SANDBOX/restore-does-not-fix" "$SANDBOX/fail-npm-ls" \
-    "$SANDBOX/fail-mise-env" "$SANDBOX/empty-mise-env"
+    "$SANDBOX/fail-mise-env" "$SANDBOX/empty-mise-env" "$SANDBOX/fail-npm-install" \
+    "$SANDBOX/fail-git-ls-remote" "$SHELL_COMMIT_FILE"
   write_npm_globals
+  write_ls_remote "$SHELL_SHA"
   printf '%s\n' "$DOCTOR_OK" > "$SANDBOX/doctor.json"
   install_bin_dir
   : > "$STUB_LOG"
@@ -175,7 +194,7 @@ check "the snapshot names the target" logged "gentle-rollback snapshot --reason 
 SNAP_LINE="$(first_line_of '^gentle-rollback snapshot')"
 UPDATE_LINE="$(first_line_of "$UPDATE_COMMANDS")"
 check "the snapshot is taken before the first update command" test -n "$SNAP_LINE" -a -n "$UPDATE_LINE" -a "${SNAP_LINE:-0}" -lt "${UPDATE_LINE:-0}"
-check "npm globals are updated package by package" logged "npm update -g @earendil-works/pi-coding-agent @openai/codex gentle-pi left-pad"
+check "npm globals are updated package by package" logged "npm update -g @earendil-works/pi-coding-agent @openai/codex left-pad"
 check "pnpm globals are updated without --latest" logged "pnpm update -g"
 check "the Pi model catalog is refreshed" logged "pi update --models"
 check "the Gentle Shell model catalog is refreshed" logged "gentle-shell --isolated update --models"
@@ -196,6 +215,78 @@ check_eq "a clean toolchain run exits 0" "0" "$RC"
 check "gentle-ai is built from main" logged "go install github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@main"
 check "engram is built from its latest release" logged "go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 check_eq "the toolchain builds exactly two Go binaries" "2" "$(grep -c '^go install ' "$STUB_LOG")"
+
+# --- Gentle Shell launcher ---------------------------------------------------
+
+reset
+run_update all
+check_eq "a clean launcher run exits 0" "0" "$RC"
+check "the main commit is resolved with git ls-remote" logged "$SHELL_LS_REMOTE"
+check "the launcher is installed from the resolved commit" logged "$SHELL_INSTALL$SHELL_SHA"
+check_eq "the installed commit is recorded" "$SHELL_SHA" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
+check_not "the registry release is no longer installed" grep -q 'gentle-pi@latest' "$STUB_LOG"
+check_not "gentle-pi is never given to npm update" grep -qE '^npm update .*gentle-pi' "$STUB_LOG"
+check "the step is named after its source" grep -qF 'Gentle Shell launcher (gentle-shell main)' <<<"$OUT"
+RESOLVE_LINE="$(first_line_of '^git ls-remote ')"
+INSTALL_LINE="$(first_line_of '^npm install --global --allow-git=all ')"
+check "the commit is resolved before the install" test -n "$RESOLVE_LINE" -a -n "$INSTALL_LINE" -a "${RESOLVE_LINE:-0}" -lt "${INSTALL_LINE:-0}"
+
+reset
+echo "$SHELL_SHA" > "$SHELL_COMMIT_FILE"
+run_update agents
+check_eq "an unchanged commit exits 0" "0" "$RC"
+check "an unchanged commit is still resolved" logged "$SHELL_LS_REMOTE"
+check_not "an unchanged commit is not reinstalled" grep -q '^npm install --global' "$STUB_LOG"
+check_eq "an unchanged commit stays recorded" "$SHELL_SHA" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
+
+reset
+echo "$SHELL_SHA_OLD" > "$SHELL_COMMIT_FILE"
+run_update agents
+check "a moved main is installed" logged "$SHELL_INSTALL$SHELL_SHA"
+check_eq "a moved main replaces the recorded commit" "$SHELL_SHA" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
+
+# The record alone is not enough: the command it describes must exist.
+reset
+echo "$SHELL_SHA" > "$SHELL_COMMIT_FILE"
+mv "$STUBS/gentle-shell" "$SANDBOX/hidden-gentle-shell"
+run_update agents
+mv "$SANDBOX/hidden-gentle-shell" "$STUBS/gentle-shell"
+check "a missing gentle-shell command is reinstalled despite the record" logged "$SHELL_INSTALL$SHELL_SHA"
+
+for unresolved in exit-status empty-output malformed-output; do
+  reset
+  echo "$SHELL_SHA_OLD" > "$SHELL_COMMIT_FILE"
+  case "$unresolved" in
+    exit-status)      touch "$SANDBOX/fail-git-ls-remote" ;;
+    empty-output)     : > "$SANDBOX/ls-remote.out" ;;
+    malformed-output) write_ls_remote "not-a-commit" ;;
+  esac
+  run_update agents
+  check_eq "unresolved main ($unresolved) fails the run" "1" "$RC"
+  check "unresolved main ($unresolved) is listed under Failed" grep -q 'Gentle Shell launcher' <<<"$(sed -n '/Failed/,$p' <<<"$OUT")"
+  check_not "unresolved main ($unresolved) installs nothing" grep -q '^npm install --global' "$STUB_LOG"
+  check_eq "unresolved main ($unresolved) keeps the recorded commit" "$SHELL_SHA_OLD" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
+  check "unresolved main ($unresolved) still updates other tools" logged "claude update"
+done
+
+reset
+touch "$SANDBOX/fail-git-ls-remote"
+run_update agents
+check_not "unresolved main records nothing on a first run" test -e "$SHELL_COMMIT_FILE"
+
+reset
+touch "$SANDBOX/fail-npm-install"
+run_update agents
+check_eq "a failing launcher install fails the run" "1" "$RC"
+check "a failing launcher install was attempted" logged "$SHELL_INSTALL$SHELL_SHA"
+check_not "a failing launcher install records no commit" test -e "$SHELL_COMMIT_FILE"
+
+reset
+touch "$GENTLE_UPDATE_STATE_DIR/holds/gentle-shell"
+run_update all
+check_not "a held gentle-shell does not resolve main" grep -q '^git ls-remote' "$STUB_LOG"
+check_not "a held gentle-shell is not reinstalled" grep -q '^npm install --global' "$STUB_LOG"
+check_not "a held gentle-shell records no commit" test -e "$SHELL_COMMIT_FILE"
 
 # --- Moshi -------------------------------------------------------------------
 
@@ -219,7 +310,7 @@ run_update all
 check_eq "a run with holds exits 0" "0" "$RC"
 check_not "a held component is not updated" logged "claude update"
 check "a held component is listed under Skipped" grep -qF 'Claude Code — held by gentle-rollback (gentle-rollback unhold claude)' <<<"$(sed -n '/Skipped/,$p' <<<"$OUT")"
-check "held npm packages are left out of the npm update" logged "npm update -g @earendil-works/pi-coding-agent gentle-pi left-pad"
+check "held npm packages are left out of the npm update" logged "npm update -g @earendil-works/pi-coding-agent left-pad"
 check "other components still update" logged "opencode upgrade"
 
 reset
