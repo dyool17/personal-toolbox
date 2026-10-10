@@ -125,4 +125,23 @@ Strategy: `ask-on-risk`. Forecast: about 200 authored changed lines, under the
   A commit file that is not a 40-hex id is treated as no commit.
 - `README.md` does not state which channel each tool tracks; left unchanged.
 
-Next step: review and delivery (push and pull request are the user's call).
+## Review
+
+- Range `69f8e12..d74e4ea`, assessed `high` (`hot_path`, `shell_source`), 5
+  paths, 550 changed lines. Consent granted by the user; four-lens native
+  review `review-2830b6f0459bdd17` closed approved and was acknowledged
+  (authority burned). No blocking finding, no correction.
+- Reviewed boundary: `d74e4ea`.
+- Advisory follow-ups, both `WARNING`, not fixed:
+  - `scripts/linux/gentle-rollback` `restore_launcher`: the commit record is
+    replaced only after the reinstall, so an interrupted restore leaves the
+    launcher at the snapshot commit while the record names the previous one.
+  - `scripts/linux/gentle-update` `install_gentle_shell`: the skip trusts that
+    record, so in that state it reports `already at main commit` until main
+    moves. Clearing the record before the reinstall would fail towards a
+    reinstall.
+- Delivery: 550 changed lines is above the 400-line budget, mostly tests;
+  the slicing decision is pending with the user.
+
+Next step: the user decides on the two follow-ups and on delivery (merge,
+push, or pull request).
