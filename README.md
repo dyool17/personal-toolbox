@@ -62,3 +62,53 @@ gentle-rollback unhold all
 - The Claude plugin cache is not copied; the plugin list is restored only while
   every install path it names still exists.
 - Credentials (`auth.json`, tokens) are never copied into a snapshot.
+
+## Daily backlog from Azure Boards (`scripts/linux/boards-backlog`)
+
+Lists the open work items assigned to me, ordered by severity, then priority,
+then oldest first, and saves what changed to Engram.
+
+```bash
+ln -s "$PWD/scripts/linux/boards-backlog" ~/.local/bin/boards-backlog
+
+boards-backlog --dry-run     # print the backlog and what would be saved
+boards-backlog               # print it, store the raw items, feed Engram
+boards-backlog --json        # ordered items with every field, as JSON
+boards-backlog --no-engram   # print and store only
+```
+
+```bash
+# Daily run at 06:00 Guatemala time (catches up after boot if the machine was off)
+systemctl --user link "$PWD/scripts/linux/systemd/boards-backlog.service"
+systemctl --user enable --now "$PWD/scripts/linux/systemd/boards-backlog.timer"
+
+systemctl --user list-timers boards-backlog.timer   # next run
+journalctl --user -u boards-backlog -e               # last run
+```
+
+It needs `AZURE_DEVOPS_EXT_PAT` with Work Items (Read); when the variable is
+unset, as in the timer, it sources `~/.azure_devops_pat`. Defaults: organization
+`innoguat`, project `Hemire`, assignee containing `dylan` or `dyool`; the
+header of the script lists the `BOARDS_*` variables that change them
+(`boards-backlog --help`).
+
+What a run leaves behind:
+
+| Where | What |
+|---|---|
+| Engram topic `boards/<project>/item-<id>` | One work item as text: fields, description, links, comments. |
+| Engram topic `boards/<project>/backlog` | The ordered list. |
+| `~/.local/state/boards-backlog/<project>/items/<id>.json` | The raw item exactly as the API returned it, plus comments. |
+| `~/.local/state/boards-backlog/<project>/backlog.md` | The ordered list from the last run. |
+
+A run saves an observation only when its text changed since the last save, and
+each topic key updates the same observation, so running it daily adds no
+duplicates. An item that leaves the backlog (closed, reassigned, or deleted on
+the board) is saved once more with its final state, so Engram never keeps
+describing it as open.
+
+Limits:
+
+- Severity exists only on bugs, so every bug sorts before items without one.
+- "Open" means the state is not `Closed`, `Done`, or `Removed`.
+- At most 200 comments per work item are fetched.

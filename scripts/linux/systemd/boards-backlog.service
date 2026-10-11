@@ -1,0 +1,25 @@
+# Daily unattended run of boards-backlog. Started by boards-backlog.timer;
+# there is no [Install] section because nothing else should pull it in.
+#
+# Read the last run:   journalctl --user -u boards-backlog -e
+# Run it now:          systemctl --user start boards-backlog
+#
+# boards-backlog exits 1 when a request or an Engram save failed, so a bad run
+# shows up as a failed unit in `systemctl --user status boards-backlog`.
+
+[Unit]
+Description=Feed the Azure Boards backlog into Engram (boards-backlog)
+# At most three attempts per run; a rejected PAT must not retry forever.
+StartLimitIntervalSec=1h
+StartLimitBurst=3
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/boards-backlog
+# The unit does not read the shell profile: name the directories that hold
+# engram, curl, and jq. The PAT comes from ~/.azure_devops_pat.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# A catch-up run right after boot can start before the network is up.
+Restart=on-failure
+RestartSec=5min
+TimeoutStartSec=10min

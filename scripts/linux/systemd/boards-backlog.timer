@@ -1,0 +1,14 @@
+# Runs boards-backlog.service once a day.
+#
+# Next run:   systemctl --user list-timers boards-backlog.timer
+
+[Unit]
+Description=Daily boards-backlog
+
+[Timer]
+OnCalendar=*-*-* 06:00:00 America/Guatemala
+# Catch up after boot when the machine was off at 06:00.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

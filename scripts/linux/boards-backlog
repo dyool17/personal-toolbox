@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# boards-backlog — my open Azure Boards work items, ordered, fed into Engram.
+#
+# For every configured project the script asks Azure DevOps for the open work
+# items whose assignee matches one of the name patterns, fetches each item with
+# all its fields, relations, and comments, and orders them:
+#
+#   1. severity   "1 - Critical" first; items without a severity come last
+#   2. priority   1 first; items without a priority come last
+#   3. age        oldest creation date first
+#   4. id
+#
+# The ordered backlog is printed as a table. Engram then receives one
+# observation per work item plus one backlog observation per project, each
+# under a stable topic key, so a later run updates the same observation
+# instead of adding a new one:
+#
+#   boards/<project>/item-<id>    one work item, readable text
+#   boards/<project>/backlog      the ordered list
+#
+# Only what changed is saved: the script keeps a hash of the text it last sent
+# for each observation and skips the save while the hash is the same. An item
+# that leaves the backlog (closed, removed, reassigned) is saved one last time
+# with its final state and then forgotten. An item deleted on the board is
+# saved one last time as Deleted, from its last stored copy.
+#
+# State lives in ${BOARDS_STATE_DIR:-~/.local/state/boards-backlog}/<project>:
+#
+#   items/<id>.json   the raw work item as the API returned it, plus comments
+#   backlog.md        the ordered list from the last run
+#   sent/<name>.sha256  hash of the text last saved to Engram
+#
+# Usage:
+#   boards-backlog [--json] [--no-engram] [--dry-run]
+#
+#   --json       Print the ordered items as raw JSON instead of the table.
+#   --no-engram  Do not save anything to Engram.
+#   --dry-run    Query and print only: no state is written, nothing is saved,
+#                and the observations that would be saved are listed on stderr.
+#
+# Environment:
+#   AZURE_DEVOPS_EXT_PAT      Personal access token with Work Items (Read).
+#   BOARDS_PAT_FILE           Shell file that exports the token, sourced when
+#                             the variable is unset (~/.azure_devops_pat).
+#   BOARDS_ORG                Organization URL (https://dev.azure.com/innoguat).
+#   BOARDS_PROJECTS           Comma separated project names (Hemire).
+#   BOARDS_ASSIGNEE_PATTERNS  Comma separated, matched with CONTAINS (dylan,dyool).
+#   BOARDS_CLOSED_STATES      States that are not backlog (Closed,Done,Removed).
+#   BOARDS_ENGRAM_PROJECT     Engram project; default is the lowercased board
+#                             project name.
+#   BOARDS_ENGRAM_TYPE        Observation type (manual).
+#   BOARDS_STATE_DIR          State directory.
+#
+# Exit status: 0 success, 1 a request or an Engram save failed, 2 usage error.
+# After a failed save the item's hash is not recorded, so the next run retries.
+
+set -uo pipefail
+
+ORG="${BOARDS_ORG:-https://dev.azure.com/innoguat}"
+ORG="${ORG%/}"
+PROJECTS="${BOARDS_PROJECTS:-Hemire}"
+PATTERNS="${BOARDS_ASSIGNEE_PATTERNS:-dylan,dyool}"
+CLOSED_STATES="${BOARDS_CLOSED_STATES:-Closed,Done,Removed}"
+ENGRAM_TYPE="${BOARDS_ENGRAM_TYPE:-manual}"
+STATE_DIR="${BOARDS_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/boards-backlog}"
+API_VERSION="7.1"
+BATCH_SIZE=200   # workitemsbatch accepts at most 200 ids per request
+
+JSON=0 ENGRAM=1 DRY_RUN=0
+FAILED=0
+
+die() { printf 'boards-backlog: %s\n' "$*" >&2; exit 1; }
+info() { printf '%s\n' "$*" >&2; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) JSON=1 ;;
+    --no-engram) ENGRAM=0 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) sed -n '2,/^set -uo/{/^set -uo/d;s/^# \{0,1\}//;p}' "$0"; exit 0 ;;
+    *) printf 'boards-backlog: unknown argument: %s\n' "$1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# A systemd unit does not read the shell profile, so when the variable is
+# missing take it from the same file the profile sources.
+PAT_FILE="${BOARDS_PAT_FILE:-$HOME/.azure_devops_pat}"
+if [ -z "${AZURE_DEVOPS_EXT_PAT:-}" ] && [ -r "$PAT_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$PAT_FILE"
+fi
+[ -n "${AZURE_DEVOPS_EXT_PAT:-}" ] || die "AZURE_DEVOPS_EXT_PAT is not set and $PAT_FILE does not define it"
+for tool in curl jq sha256sum; do
+  command -v "$tool" > /dev/null || die "$tool is required"
+done
+if [ "$ENGRAM" = 1 ] && [ "$DRY_RUN" = 0 ]; then
+  command -v engram > /dev/null || die "engram is required (or pass --no-engram)"
+fi
+
+TMP="$(mktemp -d)" || die "cannot create a temporary directory"
+trap 'rm -rf "$TMP"' EXIT
+
+# api <out-file> <url> [json-body] — GET, or POST when a body is given. The PAT
+# reaches curl through a config file descriptor, never through its arguments.
+api() {
+  local out="$1" url="$2" code
+  if [ $# -ge 3 ]; then
+    code="$(curl -sS -o "$out" -w '%{http_code}' \
+      -K <(printf 'user = ":%s"\n' "$AZURE_DEVOPS_EXT_PAT") \
+      -H 'Content-Type: application/json' -X POST --data "$3" "$url")"
+  else
+    code="$(curl -sS -o "$out" -w '%{http_code}' \
+      -K <(printf 'user = ":%s"\n' "$AZURE_DEVOPS_EXT_PAT") "$url")"
+  fi || die "request failed: $url"
+  # A rejected PAT answers 203 with a sign-in page, so only 200 is success.
+  [ "$code" = 200 ] || die "HTTP $code from $url: $(head -c 300 "$out" 2> /dev/null)"
+}
+
+WIQL_JQ='
+def apos: [39] | implode;
+def quoted: apos + gsub(apos; apos + apos) + apos;
+def list: split(",") | map(gsub("^\\s+|\\s+$"; "") | select(length > 0));
+{query: ("SELECT [System.Id] FROM WorkItems WHERE [System.TeamProject] = @project AND ("
+  + ($patterns | list | map("[System.AssignedTo] CONTAINS " + quoted) | join(" OR "))
+  + ") AND [System.State] NOT IN (" + ($closed | list | map(quoted) | join(", ")) + ")")}
+'
+
+# Input: array of raw work items. Output: ordered array of entries.
+ORDER_JQ='
+def severity: ((.fields["Microsoft.VSTS.Common.Severity"] // "" | capture("^(?<n>[0-9]+)").n | tonumber) // 9);
+[ .[]
+  | {project: $project, id, rev,
+     open: (.id as $id | any($open[]; . == $id)),
+     item: ., comments: ($comments[.id | tostring] // [])} ]
+| sort_by([(.item | severity),
+           (.item.fields["Microsoft.VSTS.Common.Priority"] // 9),
+           (.item.fields["System.CreatedDate"] // ""),
+           .id])
+'
+
+# Input: ordered entries. Output: one {id, open, title, topic, line, body} per entry.
+RENDER_JQ='
+def text:
+  if type != "string" then (. // "" | tostring)
+  else gsub("\r"; "")
+    | gsub("(?i)<br\\s*/?>"; "\n")
+    | gsub("(?i)</(p|div|li|h[1-6]|tr)>"; "\n")
+    | gsub("(?i)<li[^>]*>"; "- ")
+    | gsub("<[^>]+>"; "")
+    | gsub("&nbsp;"; " ") | gsub("&lt;"; "<") | gsub("&gt;"; ">")
+    | gsub("&quot;"; "\"") | gsub("&#39;"; [39] | implode) | gsub("&amp;"; "&")
+    | gsub("[ \t]+\n"; "\n") | gsub("\n{3,}"; "\n\n")
+    | sub("^\\s+"; "") | sub("\\s+$"; "")
+  end;
+def person: if type == "object" then "\(.displayName) <\(.uniqueName)>" else (. // "-") end;
+def day: (. // "-")[0:10];
+def section($title; $value):
+  ($value | text) as $t | if ($t | length) > 0 then "\n\n## \($title)\n\($t)" else "" end;
+def related($entry; $rel):
+  [$entry.item.relations[]? | select(.rel == $rel) | "#" + (.url | split("/") | last)]
+  | if length > 0 then join(", ") else "-" end;
+
+.[] | . as $e | .item.fields as $f
+| ($f["System.WorkItemType"] // "Work item") as $type
+| ($f["System.Title"] // "") as $title
+| {id, open,
+   title: "\(.project) #\(.id) [\($type)] \($title)",
+   topic: "boards/\($slug)/item-\(.id)",
+   line: "#\(.id) | \($type) | Sev \($f["Microsoft.VSTS.Common.Severity"] // "-") | P\($f["Microsoft.VSTS.Common.Priority"] // "-") | \($f["System.State"] // "-") | created \($f["System.CreatedDate"] | day) | \($title)",
+   body: (
+     ([ "URL: \(.item._links.html.href // "\($org)/_workitems/edit/\(.id)")",
+        "Type: \($type)",
+        "State: \($f["System.State"] // "-") (\($f["System.Reason"] // "-"))",
+        "Severity: \($f["Microsoft.VSTS.Common.Severity"] // "-") | Priority: \($f["Microsoft.VSTS.Common.Priority"] // "-")",
+        "Assigned to: \($f["System.AssignedTo"] | person)",
+        "Area: \($f["System.AreaPath"] // "-") | Iteration: \($f["System.IterationPath"] // "-")",
+        "Board column: \($f["System.BoardColumn"] // "-") | Value area: \($f["Microsoft.VSTS.Common.ValueArea"] // "-")",
+        "Tags: \($f["System.Tags"] // "-")",
+        "Parent: \(related($e; "System.LinkTypes.Hierarchy-Reverse")) | Children: \(related($e; "System.LinkTypes.Hierarchy-Forward"))",
+        "Created: \($f["System.CreatedDate"] | day) by \($f["System.CreatedBy"] | person)",
+        "Changed: \($f["System.ChangedDate"] | day) by \($f["System.ChangedBy"] | person) (rev \(.rev))"
+      ] | join("\n"))
+     + section("Description"; $f["System.Description"])
+     + section("Repro steps"; $f["Microsoft.VSTS.TCM.ReproSteps"])
+     + section("Acceptance criteria"; $f["Microsoft.VSTS.Common.AcceptanceCriteria"])
+     + section("Links"; [.item.relations[]? | select(.rel == "ArtifactLink")
+                         | "- \(.attributes.name // "link"): \(.url)"] | join("\n"))
+     + section("Comments"; [.comments[] | "- \(.createdDate | day) \(.createdBy.displayName // "-"): \(.text | text)"] | join("\n"))
+   )}
+'
+
+TABLE_JQ='
+def age: ((.item.fields["System.CreatedDate"] // "" | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $t
+          | ((now - $t) / 86400 | floor | tostring) + "d") // "-";
+(["#", "ID", "PROJECT", "TYPE", "SEVERITY", "PRI", "STATE", "AGE", "TITLE"] | @tsv),
+(to_entries[] | .value as $e | $e.item.fields as $f
+ | [.key + 1, "#\($e.id)", $e.project, $f["System.WorkItemType"] // "-",
+    $f["Microsoft.VSTS.Common.Severity"] // "-", $f["Microsoft.VSTS.Common.Priority"] // "-",
+    $f["System.State"] // "-", ($e | age), $f["System.Title"] // ""] | @tsv)
+'
+
+# send <sent-file> <title> <topic> <body> <engram-project> — save to Engram
+# unless the same text was already sent. Returns 1 when the save failed.
+send() {
+  local sent="$1" title="$2" topic="$3" body="$4" engram_project="$5" hash
+  hash="$(printf '%s\n%s\n' "$title" "$body" | sha256sum | cut -d' ' -f1)"
+  [ -f "$sent" ] && [ "$(cat "$sent")" = "$hash" ] && return 0
+  if [ "$DRY_RUN" = 1 ]; then
+    info "would save: $topic — $title"
+    return 0
+  fi
+  if engram save "$title" "$body" --type "$ENGRAM_TYPE" --project "$engram_project" --topic "$topic" > /dev/null; then
+    mkdir -p "$(dirname "$sent")" && printf '%s\n' "$hash" > "$sent"
+    SAVED=$((SAVED + 1))
+  else
+    info "boards-backlog: engram save failed: $topic"
+    FAILED=$((FAILED + 1))
+    return 1
+  fi
+}
+
+# sync_project <project> — writes $TMP/<slug>.entries.json (open items, ordered).
+sync_project() {
+  local project="$1" slug pdir enc engram_project work n chunk id
+  slug="$(printf '%s' "$project" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-')"
+  pdir="$STATE_DIR/$slug"
+  enc="$(jq -rn --arg p "$project" '$p | @uri')"
+  engram_project="${BOARDS_ENGRAM_PROJECT:-$slug}"
+  work="$TMP/$slug"
+  mkdir -p "$work"
+  SAVED=0
+
+  api "$work/wiql.json" "$ORG/$enc/_apis/wit/wiql?api-version=$API_VERSION" \
+    "$(jq -cn --arg patterns "$PATTERNS" --arg closed "$CLOSED_STATES" "$WIQL_JQ")"
+  jq -c '[.workItems[].id]' "$work/wiql.json" > "$work/open.json" \
+    || die "unexpected query response for $project"
+
+  # Items already sent to Engram are fetched too, so the one that left the
+  # backlog gets its final state saved.
+  : > "$work/tracked"
+  if [ "$ENGRAM" = 1 ] && [ -d "$pdir/sent" ]; then
+    find "$pdir/sent" -name '[0-9]*.sha256' -printf '%f\n' | sed 's/\.sha256$//' > "$work/tracked"
+  fi
+  jq -c --rawfile tracked "$work/tracked" \
+    '. + ($tracked | split("\n") | map(select(length > 0) | tonumber)) | unique' \
+    "$work/open.json" > "$work/ids.json"
+
+  jq -c --argjson size "$BATCH_SIZE" 'range(0; length; $size) as $i | .[$i:$i + $size]' \
+    "$work/ids.json" > "$work/chunks.jsonl" || die "cannot split the ids of $project"
+  n=0
+  while IFS= read -r chunk; do
+    n=$((n + 1))
+    api "$work/batch.$n.json" "$ORG/_apis/wit/workitemsbatch?api-version=$API_VERSION" \
+      "$(jq -cn --argjson ids "$chunk" '{ids: $ids, "$expand": "all", errorPolicy: "omit"}')"
+  done < "$work/chunks.jsonl"
+  if [ "$n" -gt 0 ]; then
+    jq -cs '[.[].value[] | select(. != null)]' "$work"/batch.*.json > "$work/items.json"
+  else
+    echo '[]' > "$work/items.json"
+  fi
+
+  echo '{}' > "$work/comments.json"
+  jq -r '.[] | select((.fields["System.CommentCount"] // 0) > 0) | .id' "$work/items.json" \
+    > "$work/commented" || die "unexpected work item response for $project"
+  while IFS= read -r id; do
+    api "$work/comment.json" \
+      "$ORG/$enc/_apis/wit/workItems/$id/comments?api-version=$API_VERSION-preview.4&\$top=200&order=asc"
+    jq -c --arg id "$id" --slurpfile c "$work/comment.json" '.[$id] = ($c[0].comments // [])' \
+      "$work/comments.json" > "$work/comments.next" && mv "$work/comments.next" "$work/comments.json"
+  done < "$work/commented"
+
+  # A tracked item the API no longer returns was deleted on the board. Its last
+  # stored copy comes back marked Deleted, so Engram stops describing it as open.
+  jq -r --slurpfile items "$work/items.json" '. - ($items[0] | map(.id)) | .[]' \
+    "$work/ids.json" > "$work/gone" || die "cannot compare the items of $project"
+  while IFS= read -r id; do
+    if [ -f "$pdir/items/$id.json" ]; then
+      jq -c --slurpfile gone "$pdir/items/$id.json" \
+        '. + [$gone[0].item | .fields["System.State"] = "Deleted"
+              | .fields["System.Reason"] = "no longer returned by Azure Boards"]' \
+        "$work/items.json" > "$work/items.next" && mv "$work/items.next" "$work/items.json"
+      jq -c --arg id "$id" --slurpfile gone "$pdir/items/$id.json" '.[$id] = ($gone[0].comments // [])' \
+        "$work/comments.json" > "$work/comments.next" && mv "$work/comments.next" "$work/comments.json"
+    elif [ "$DRY_RUN" = 0 ]; then
+      rm -f "$pdir/sent/$id.sha256"
+    fi
+  done < "$work/gone"
+
+  jq -c --arg project "$project" --slurpfile open "$work/open.json" \
+    --slurpfile comments "$work/comments.json" \
+    '$open[0] as $open | $comments[0] as $comments | '"$ORDER_JQ" \
+    "$work/items.json" > "$work/all.json" || die "cannot order the items of $project"
+  jq -c 'map(select(.open))' "$work/all.json" > "$TMP/$slug.entries.json"
+  jq -c --arg slug "$slug" --arg org "$ORG/$enc" "$RENDER_JQ" "$work/all.json" > "$work/rendered.jsonl" \
+    || die "cannot render the items of $project"
+
+  local backlog
+  backlog="$(jq -rs 'map(select(.open)) | if length == 0 then "No open work items."
+                     else to_entries | map("\(.key + 1). \(.value.line)") | join("\n") end' \
+             "$work/rendered.jsonl")"
+
+  if [ "$DRY_RUN" = 0 ]; then
+    mkdir -p "$pdir/items"
+    while IFS= read -r id; do
+      jq --argjson id "$id" '.[] | select(.id == $id) | {item, comments}' "$work/all.json" \
+        > "$pdir/items/$id.json"
+    done < <(jq -r '.[].id' "$work/all.json")
+    printf '%s\n' "$backlog" > "$pdir/backlog.md"
+  fi
+
+  if [ "$ENGRAM" = 1 ]; then
+    local entry open
+    while IFS= read -r entry; do
+      id="$(jq -r '.id' <<< "$entry")"
+      open="$(jq -r '.open' <<< "$entry")"
+      if send "$pdir/sent/$id.sha256" "$(jq -r '.title' <<< "$entry")" \
+           "$(jq -r '.topic' <<< "$entry")" "$(jq -r '.body' <<< "$entry")" "$engram_project"; then
+        # Out of the backlog and its final state saved: stop tracking it.
+        if [ "$open" = false ] && [ "$DRY_RUN" = 0 ]; then rm -f "$pdir/sent/$id.sha256"; fi
+      fi
+    done < "$work/rendered.jsonl"
+    send "$pdir/sent/backlog.sha256" "Boards backlog: $project" "boards/$slug/backlog" \
+      "$backlog" "$engram_project" || true
+  fi
+
+  info "$project: $(jq 'length' "$TMP/$slug.entries.json") open, $SAVED saved to engram"
+}
+
+[ -n "$(jq -rn --arg p "$PATTERNS" '$p | gsub("[, \t]"; "")')" ] || die "BOARDS_ASSIGNEE_PATTERNS is empty"
+
+IFS=',' read -r -a PROJECT_LIST <<< "$PROJECTS"
+for project in "${PROJECT_LIST[@]}"; do
+  project="$(sed 's/^[[:space:]]*//;s/[[:space:]]*$//' <<< "$project")"
+  [ -n "$project" ] && sync_project "$project"
+done
+
+shopt -s nullglob
+ENTRY_FILES=("$TMP"/*.entries.json)
+[ "${#ENTRY_FILES[@]}" -gt 0 ] || die "BOARDS_PROJECTS names no project"
+if [ "$JSON" = 1 ]; then
+  jq -s 'add | map({project, id, rev, item, comments})' "${ENTRY_FILES[@]}"
+else
+  jq -rs "add | $TABLE_JQ" "${ENTRY_FILES[@]}" | column -t -s "$(printf '\t')"
+fi
+
+[ "$FAILED" -eq 0 ] || exit 1
