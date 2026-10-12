@@ -9,7 +9,7 @@ Three scripts keep the local agent tooling current and recoverable:
 |---|---|
 | `gentle-update` | Updates agents, the Gentleman toolchain, Claude plugins, and global packages. Snapshots first, skips held components, and rolls back a tool that stops running. |
 | `gentle-rollback` | Takes snapshots, restores components from one, and manages holds. |
-| `gentle-reset` | Clears stale state, caches, and long-lived daemons, then runs `gentle-update`. |
+| `gentle-reset` | Clears stale state, caches, leftover temp files, and long-lived daemons, then runs `gentle-update`. |
 
 Each script documents its groups and flags in its header (`gentle-update --help`).
 

@@ -8,7 +8,8 @@
 #
 #   state    Bookkeeping that outlived the process which wrote it.
 #            engram's unclosed session rows, leftover upgrade staging dirs.
-#   caches   Regenerable package-manager caches and agent scratchpads.
+#   caches   Regenerable package-manager caches, agent scratchpads, and this
+#            user's leftovers in /tmp and $TMPDIR that no live process holds.
 #   daemons  Long-lived servers, stopped so the next launch picks up whatever
 #            `update` installs.
 #   update   Delegates to gentle-update.
@@ -154,6 +155,78 @@ reset_agent_scratchpads() {
   reclaim "agent scratchpads" "/tmp/claude-$(id -u)"
 }
 
+# Directories swept by reset_temp_scratch, one per line: /tmp, plus $TMPDIR
+# when it points elsewhere. GENTLE_RESET_TMP_ROOTS (colon-separated) replaces
+# the list.
+temp_roots() {
+  if [ -n "${GENTLE_RESET_TMP_ROOTS:-}" ]; then
+    printf '%s\n' "$GENTLE_RESET_TMP_ROOTS" | tr ':' '\n'
+    return 0
+  fi
+  printf '/tmp\n'
+  if [ -n "${TMPDIR:-}" ] && [ "${TMPDIR%/}" != /tmp ]; then
+    printf '%s\n' "${TMPDIR%/}"
+  fi
+}
+
+# Every path a live process of this user holds: working directories and open
+# files. find rather than readlink: readlink gives up at the first link it may
+# not read, and another user's process always comes first in /proc.
+temp_paths_in_use() {
+  find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%l\n' 2>/dev/null | sort -u
+}
+
+# Verification scratch copies and build probes pile up in the temp roots, and
+# /tmp is RAM-backed here. Sweep this user's top-level leftovers, keeping
+# anything that still looks alive: hidden entries (X11 and ICE sockets), entries
+# holding a socket or fifo (tmux, ssh-agent), and entries a running process has
+# as its working directory or holds open. An agent between two commands holds
+# nothing open, so close your agents first.
+reset_temp_scratch() {
+  local uid in_use root entry size verb removed=0 empty=0 kept=0
+  uid="$(id -u)"
+  in_use="$(temp_paths_in_use)"
+
+  while read -r root; do
+    [ -d "$root" ] || continue
+    for entry in "$root"/*; do
+      [ -e "$entry" ] || [ -L "$entry" ] || continue
+      [ -O "$entry" ] || continue
+      # Owned by the agent scratchpads step, which checks for a live Claude Code.
+      [ "$entry" = "/tmp/claude-$uid" ] && continue
+
+      if [ ! -L "$entry" ]; then
+        if [ -n "$(find "$entry" \( -type s -o -type p \) -print -quit 2>/dev/null)" ] \
+          || printf '%s\n' "$in_use" | awk -v p="$entry" \
+               '$0 == p || index($0, p "/") == 1 { found = 1; exit } END { exit !found }'; then
+          kept=$((kept + 1))
+          continue
+        fi
+      fi
+
+      # Empty mktemp leftovers number in the thousands, so they are only
+      # counted; `run` is bypassed for the same reason.
+      size="$(du -sh "$entry" 2>/dev/null | awk '{print $1}')"
+      if [ "${size:-?}" = 0 ]; then
+        empty=$((empty + 1))
+      else
+        printf '  %s (%s)\n' "$entry" "${size:-?}"
+      fi
+      if [ "$DRY_RUN" != 1 ]; then
+        rm -rf --one-file-system -- "$entry" || return 1
+      fi
+      removed=$((removed + 1))
+    done
+  done < <(temp_roots)
+
+  if [ "$removed" -eq 0 ]; then
+    skip "temp scratch — nothing left behind"
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then verb="would remove"; else verb="removed"; fi
+  printf '  %s %s entries (%s of them empty), kept %s still in use\n' "$verb" "$removed" "$empty" "$kept"
+}
+
 # --- daemons -----------------------------------------------------------------
 
 # herdr clients exit when the server goes away, and a mosh-server follows its
@@ -264,6 +337,7 @@ if wants caches; then
   step "npm caches"        npm  reset_npm_caches
   step "pnpm store"        pnpm reset_pnpm_store
   step "agent scratchpads" -    reset_agent_scratchpads
+  step "temp scratch"      -    reset_temp_scratch
 fi
 
 if wants daemons; then
