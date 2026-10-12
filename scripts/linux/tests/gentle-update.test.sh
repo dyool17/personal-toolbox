@@ -45,7 +45,7 @@ export GENTLE_SHELL_HOME="$HOME/.gentle-shell/agent"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 export PNPM_HOME="$SANDBOX/pnpm"
 # The run must not depend on the shell the tests were started from.
-unset GENTLE_UPDATE_LOCK_HELD GENTLE_UPDATE_NO_SNAPSHOT XDG_STATE_HOME MISE_SHELL HERDR_ENV GENTLE_PI_CONFIG_HOME
+unset GENTLE_UPDATE_LOCK_HELD GENTLE_UPDATE_NO_SNAPSHOT XDG_STATE_HOME MISE_SHELL HERDR_ENV GENTLE_PI_CONFIG_HOME GENTLE_AI_HOME
 
 APP="$SANDBOX/app"
 STUBS="$SANDBOX/stubs"
@@ -53,7 +53,7 @@ mkdir -p "$APP" "$STUBS" "$GENTLE_UPDATE_BIN_DIR" "$PNPM_HOME/bin" "$SANDBOX/gop
   "$PI_CODING_AGENT_DIR" "$GENTLE_SHELL_HOME" "$GENTLE_UPDATE_STATE_DIR/holds"
 : > "$STUB_LOG"
 
-# Only the standard Pi home has a Moshi hook; the Gentle Shell home never had one.
+# Only the standard Pi home has a Moshi hook yet; the update wires both homes.
 mkdir -p "$PI_CODING_AGENT_DIR/extensions"
 : > "$PI_CODING_AGENT_DIR/extensions/moshi-hooks.ts"
 
@@ -115,6 +115,8 @@ case "$name $*" in
     fi
     ;;
   "moshi-hook service restart") touch "$SANDBOX/moshi-restarted" ;;
+  # Pi hooks go into whichever home the caller selected; record which one.
+  "moshi-hook install --target pi") printf '%s\n' "$PI_CODING_AGENT_DIR" >> "$SANDBOX/moshi-pi-homes.log" ;;
   "moshi-hook update")
     # A real update replaces the binary; do the same when the test asks for it.
     if [ -e "$SANDBOX/moshi-new-build" ]; then
@@ -171,6 +173,10 @@ reset() {
     "$SANDBOX/fail-mise-env" "$SANDBOX/empty-mise-env" "$SANDBOX/fail-npm-install" \
     "$SANDBOX/fail-git-ls-remote" "$SHELL_COMMIT_FILE" \
     "$SANDBOX/moshi-restarted" "$SANDBOX/doctor-warming"
+  : > "$SANDBOX/moshi-pi-homes.log"
+  mkdir -p "$HOME/.gentle-ai"
+  printf '%s\n' '{"installed_agents": ["pi", "claude-code", "opencode", "codex"]}' > "$HOME/.gentle-ai/state.json"
+  install -m 755 "$SANDBOX/stub" "$STUBS/opencode"
   write_npm_globals
   write_ls_remote "$SHELL_SHA"
   printf '%s\n' "$DOCTOR_OK" > "$SANDBOX/doctor.json"
@@ -210,8 +216,10 @@ check "pnpm globals are updated without --latest" logged "pnpm update -g"
 check "the Pi model catalog is refreshed" logged "pi update --models"
 check "the Gentle Shell model catalog is refreshed" logged "gentle-shell --isolated update --models"
 check "moshi-hook is updated" logged "moshi-hook update"
-check_eq "Pi hooks are reinstalled only in the Pi home that had one" "1" "$(grep -cxF 'moshi-hook install --target pi' "$STUB_LOG")"
+check_eq "Pi hooks are installed in both Pi homes" "$PI_CODING_AGENT_DIR,$GENTLE_SHELL_HOME" "$(paste -sd, "$SANDBOX/moshi-pi-homes.log")"
 check "hooks are reinstalled for the other ready agent" logged "moshi-hook install --target claude"
+check "Codex gets its hooks even when doctor does not list it as ready" logged "moshi-hook install --target codex"
+check_not "an agent that is neither ready nor always wired is left alone" logged "moshi-hook install --target opencode"
 check_not "hooks are not installed for agents that had none" grep -q 'install --target opencode' "$STUB_LOG"
 check_not "the Moshi daemon is left alone when the binary did not change" logged "moshi-hook service restart"
 check_not "doctor is never run with --yes" grep -qE 'doctor.*--yes' "$STUB_LOG"
@@ -226,6 +234,20 @@ check_eq "a clean toolchain run exits 0" "0" "$RC"
 check "gentle-ai is built from main" logged "go install github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@main"
 check "engram is built from its latest release" logged "go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 check_eq "the toolchain builds exactly two Go binaries" "2" "$(grep -c '^go install ' "$STUB_LOG")"
+check "installed assets are synced to the new gentle-ai" logged "gentle-ai sync"
+check "the sync runs after the gentle-ai build" test "$(first_line_of '^go install .*gentle-ai@main$')" -lt "$(first_line_of '^gentle-ai sync$')"
+
+reset
+rm -f "$STUBS/opencode"
+run_update toolchain
+check_eq "a sync that leaves out a missing agent exits 0" "0" "$RC"
+check "an installed agent whose CLI is missing is left out of the sync" logged "gentle-ai sync --agents pi,claude-code,codex"
+check "the agent left out is reported" grep -q "gentle-ai sync for opencode — 'opencode' is not on PATH" <<<"$OUT"
+
+reset
+touch "$GENTLE_UPDATE_STATE_DIR/holds/gentle-ai"
+run_update toolchain
+check_not "a held gentle-ai is not synced" grep -q '^gentle-ai sync' "$STUB_LOG"
 
 # --- Gentle Shell launcher ---------------------------------------------------
 
@@ -298,6 +320,45 @@ run_update all
 check_not "a held gentle-shell does not resolve main" grep -q '^git ls-remote' "$STUB_LOG"
 check_not "a held gentle-shell is not reinstalled" grep -q '^npm install --global' "$STUB_LOG"
 check_not "a held gentle-shell records no commit" test -e "$SHELL_COMMIT_FILE"
+
+# --- Gentle Shell MCP servers ---------------------------------------------------
+
+STD_MCP="$PI_CODING_AGENT_DIR/mcp.json"
+GS_MCP="$GENTLE_SHELL_HOME/mcp.json"
+rm -f "$STD_MCP" "$GS_MCP"
+printf '%s\n' '{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--mcp"]},"context7":{"command":"npx"}}}' > "$STD_MCP"
+
+reset
+run_update packages
+check_eq "the Gentle Shell home receives the standard MCP servers" \
+  "codegraph,context7" "$(jq -r '.mcpServers | keys | join(",")' "$GS_MCP")"
+check "the added servers are named" grep -q 'added MCP server(s) to the Gentle Shell home: codegraph, context7' <<<"$OUT"
+check_eq "a new MCP config is private" "600" "$(stat -c %a "$GS_MCP")"
+
+reset
+run_update packages
+check_not "a second run adds nothing" grep -q 'added MCP server' <<<"$OUT"
+
+# A server installed later is carried over; an entry already there is not touched.
+printf '%s\n' '{"mcpServers":{"codegraph":{"command":"codegraph"},"later":{"command":"later-mcp"},"context7":{"command":"npx"}}}' > "$STD_MCP"
+printf '%s\n' '{"mcpServers":{"codegraph":{"command":"my-codegraph"}},"other":1}' > "$GS_MCP"
+reset
+run_update packages
+check_eq "a server installed later is carried over" "codegraph,context7,later" \
+  "$(jq -r '.mcpServers | keys | join(",")' "$GS_MCP")"
+check_eq "an existing Gentle Shell entry is kept" "my-codegraph" "$(jq -r '.mcpServers.codegraph.command' "$GS_MCP")"
+check_eq "other keys in the Gentle Shell config are kept" "1" "$(jq -r '.other' "$GS_MCP")"
+
+printf '%s\n' '{not json' > "$GS_MCP"
+reset
+run_update packages
+check_eq "an invalid Gentle Shell MCP config is left untouched" '{not json' "$(cat "$GS_MCP")"
+check "an invalid config is reported" grep -q 'is not valid JSON; left untouched' <<<"$OUT"
+
+rm -f "$STD_MCP" "$GS_MCP"
+reset
+run_update packages
+check_not "no standard MCP config creates none" test -e "$GS_MCP"
 
 # --- Moshi -------------------------------------------------------------------
 

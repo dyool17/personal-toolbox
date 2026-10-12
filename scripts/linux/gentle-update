@@ -11,10 +11,13 @@
 #              gentle-ai is built from the tip of main; engram from its latest
 #              official release (never main). The standalone Gentle Shell home
 #              is provisioned by its launcher instead of syncing the regular
-#              Pi home.
+#              Pi home. `gentle-ai sync` then brings the installed skills,
+#              agents and instructions up to the build that was just built.
 #   plugins    Claude Code marketplaces and installed plugins.
 #   packages   Global package managers and standalone binaries.
-#              npm globals, pnpm globals, moshi-hook, mise itself.
+#              npm globals, pnpm globals, moshi-hook, mise itself. The
+#              moshi-hook step also installs its hooks for Claude Code, Codex
+#              and both Pi homes.
 #   runtimes   Language runtimes managed by mise. NOT part of `all` — see below.
 #
 # The standalone launcher is updated before its isolated home is provisioned.
@@ -74,6 +77,8 @@ PI_NPM_PACKAGE="@earendil-works/pi-coding-agent"
 CODEX_NPM_PACKAGE="@openai/codex"
 PNPM_GLOBAL_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
 PI_HOMES=("${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" "${GENTLE_SHELL_HOME:-$HOME/.gentle-shell/agent}")
+# Agents whose Moshi hooks every update installs, named as moshi-hook targets.
+MOSHI_AGENTS=(claude codex pi)
 # Tools that must still answer `--version` after the run. Each name is also
 # the gentle-rollback component that restores it.
 SMOKE_TOOLS=(claude codex opencode pi gentle-shell herdr gentle-ai engram moshi-hook mise)
@@ -173,6 +178,37 @@ install_go_binary() {
 # Rebuilding gentle-ai into BIN_DIR removes the shadowing copy the override may
 # still name, so repair a *broken* override here. An override whose binary
 # still exists is a deliberate choice and is never redirected.
+# A new gentle-ai binary does not rewrite what the previous one installed: the
+# skills, agent definitions and instructions on disk stay at the old build
+# until `gentle-ai sync` runs.
+#
+# sync fails the whole run when one installed agent has no runtime, so an agent
+# whose CLI is missing is left out and reported instead.
+sync_gentle_ai_assets() {
+  local state="${GENTLE_AI_HOME:-$HOME/.gentle-ai}/state.json"
+  local agent binary agents=() dropped=0
+
+  while read -r agent; do
+    [ -n "$agent" ] || continue
+    case "$agent" in
+      claude-code) binary=claude ;;
+      *)           binary="$agent" ;;
+    esac
+    if command -v "$binary" >/dev/null 2>&1; then
+      agents+=("$agent")
+    else
+      dropped=1
+      skip "gentle-ai sync for $agent — '$binary' is not on PATH"
+    fi
+  done < <(jq -r '.installed_agents[]?' "$state" 2>/dev/null)
+
+  if [ "$dropped" = 1 ] && [ ${#agents[@]} -gt 0 ]; then
+    gentle-ai sync --agents "$(IFS=,; printf '%s' "${agents[*]}")"
+  else
+    gentle-ai sync
+  fi
+}
+
 sync_gentle_ai_dev_override() {
   local config_home="${GENTLE_PI_CONFIG_HOME:-$HOME/.pi/gentle-ai}"
   local file="$config_home/dev-binary.json"
@@ -380,9 +416,11 @@ update_moshi_hook() {
   bin="$(command -v moshi-hook)" || return 1
   before_sha="$(sha256sum "$bin" | cut -d' ' -f1)"
   before_doc="$(moshi-hook doctor --json 2>/dev/null </dev/null)"
-  # Only agents that already have hooks get them reinstalled; an update must
-  # never wire Moshi into an agent the user did not set up.
+  # Claude Code, Codex and Pi are always wired. Any other agent gets its hooks
+  # reinstalled only when it already has them; an update must never wire Moshi
+  # into an agent the user did not set up.
   ready="$(jq -r '.features[]? | select(.id == "inbox") | .readyAgents[]?' <<<"$before_doc" 2>/dev/null)"
+  ready="$(printf '%s\n' "${MOSHI_AGENTS[@]}" "$ready" | awk 'NF && !seen[$0]++')"
 
   moshi-hook update || return 1
 
@@ -391,13 +429,18 @@ update_moshi_hook() {
       "") ;;
       pi)
         # Pi hooks live inside a Pi home, and there are two of them. doctor
-        # reports `pi` as one agent, so check each home for its own hook file.
+        # reports `pi` as one agent and only looks at the standard home, so
+        # every home that exists gets its own install.
         for home in "${PI_HOMES[@]}"; do
-          [ -f "$home/extensions/moshi-hooks.ts" ] || continue
+          [ -d "$home" ] || continue
           PI_CODING_AGENT_DIR="$home" moshi-hook install --target pi || status=1
         done
         ;;
       *)
+        if ! command -v "$agent" >/dev/null 2>&1; then
+          printf "  moshi-hook: %s is not installed; its hooks are left alone\n" "$agent"
+          continue
+        fi
         moshi-hook install --target "$agent" || status=1
         ;;
     esac
@@ -486,6 +529,35 @@ dedupe_gentle_shell_home() {
     ok "removed duplicate unpinned package(s) from the Gentle Shell home: $before -> $after"
   fi
   rm -f "$tmp"
+}
+
+# Pi reads MCP servers from <home>/mcp.json, and `gentle-ai` only writes the
+# standard home, so the Gentle Shell home never sees codegraph or any server
+# installed later. Carry over the servers it is missing; an entry already in the
+# Gentle Shell home is never touched, so local edits win.
+sync_gentle_shell_mcp() {
+  command -v jq >/dev/null 2>&1 || return 0
+  local source="${PI_HOMES[0]}/mcp.json" target="${PI_HOMES[1]}/mcp.json"
+  [ "$source" != "$target" ] && [ -f "$source" ] && [ -d "${PI_HOMES[1]}" ] || return 0
+
+  local src dst='{}' merged added
+  src="$(jq -c . "$source" 2>/dev/null)" || return 0
+  if [ -f "$target" ]; then
+    dst="$(jq -c . "$target" 2>/dev/null)" || {
+      warn "Gentle Shell MCP config $target is not valid JSON; left untouched"
+      return 0
+    }
+  fi
+
+  added="$(jq -rn --argjson s "$src" --argjson d "$dst" \
+    '(($s.mcpServers // {}) | keys) - (($d.mcpServers // {}) | keys) | join(", ")' 2>/dev/null)" || return 0
+  [ -n "$added" ] || return 0
+  merged="$(jq -n --argjson s "$src" --argjson d "$dst" \
+    '$d | .mcpServers = (($s.mcpServers // {}) + ($d.mcpServers // {}))' 2>/dev/null)" || return 0
+
+  [ -f "$target" ] || { : > "$target"; chmod 600 "$target"; }
+  printf '%s\n' "$merged" > "$target"
+  ok "added MCP server(s) to the Gentle Shell home: $added"
 }
 
 answers_version() { timeout 20 "$1" --version >/dev/null 2>&1 </dev/null; }
@@ -667,6 +739,7 @@ if wants toolchain; then
   heading "Gentleman toolchain (gentle-ai: main, engram: latest release)"
   step gentle-ai "gentle-ai" go install_go_binary gentle-ai "$GENTLE_AI_PKG"
   step engram    "engram"    go install_go_binary engram    "$ENGRAM_PKG"
+  step gentle-ai "gentle-ai sync" gentle-ai sync_gentle_ai_assets
   sync_gentle_ai_dev_override
 fi
 
@@ -692,6 +765,7 @@ fi
 hash -r 2>/dev/null || true
 
 dedupe_gentle_shell_home
+sync_gentle_shell_mcp
 check_pi_homes
 smoke_check
 
