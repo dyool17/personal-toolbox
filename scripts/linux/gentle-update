@@ -45,6 +45,11 @@
 #     held, and the run is reported as failed. When it cannot be rolled back it
 #     is held anyway and reported for what happened.
 #
+# npm install scripts are allowed only for gentle-pi, @google/genai and
+# protobufjs during direct npm updates and Pi/Gentle Shell package installs.
+# This trusts future versions of these names, not every package, and never
+# changes the user's npm configuration.
+#
 # Usage:
 #   gentle-update [all|agents|toolchain|plugins|packages|runtimes]
 #   gentle-update --help
@@ -66,6 +71,8 @@ GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@main"
 ENGRAM_PKG="github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 # The npm package name remains gentle-pi; it installs the gentle-shell command.
 GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
+# Command-local lifecycle permission; never persist it in the user's npmrc.
+NPM_SCRIPT_ALLOWLIST="gentle-pi,@google/genai,protobufjs"
 # The launcher is installed from the main branch of its repository instead of
 # the registry release. npm does not record the commit of a git-installed
 # global, so the installed commit is kept in the state directory, where
@@ -256,7 +263,8 @@ install_gentle_shell() {
   fi
 
   # npm refuses git packages unless they are allowed explicitly.
-  npm install --global --allow-git=all "${GENTLE_SHELL_GIT_SPEC}#${sha}" || return 1
+  npm install --global --allow-git=all --allow-scripts="$NPM_SCRIPT_ALLOWLIST" \
+    "${GENTLE_SHELL_GIT_SPEC}#${sha}" || return 1
   hash -r 2>/dev/null || true
 
   # Recorded only now, so a failed install never claims a commit. Written
@@ -268,6 +276,12 @@ install_gentle_shell() {
     return 1
   fi
   printf '  installed main commit %s\n' "${sha:0:12}"
+}
+
+# Pi and Gentle Shell spawn npm internally. Pass the same narrow policy to
+# those installers only, without exporting permission to unrelated steps.
+with_npm_script_allowlist() {
+  env npm_config_allow_scripts="$NPM_SCRIPT_ALLOWLIST" "$@"
 }
 
 # --- agents ------------------------------------------------------------------
@@ -375,7 +389,7 @@ update_npm_globals() {
     printf '  no npm globals to update\n'
     return 0
   fi
-  npm update -g "${pkgs[@]}" || return 1
+  npm update -g --allow-scripts="$NPM_SCRIPT_ALLOWLIST" "${pkgs[@]}" || return 1
   restore_pnpm_bins
 }
 
@@ -718,11 +732,11 @@ if wants agents || wants toolchain; then
   if wants agents; then
     # --all also refreshes the packages the plain `pi` home declares, so it
     # never lags behind the isolated Gentle Shell home.
-    step pi "PATH Pi runtime + extensions" pi pi update --all
+    step pi "PATH Pi runtime + extensions" pi with_npm_script_allowlist pi update --all
     # --all does not touch the model catalogs; those have their own flag.
     step pi "Pi model catalog" pi pi update --models
   fi
-  step gentle-shell "Gentle Shell setup" gentle-shell gentle-shell --isolated setup
+  step gentle-shell "Gentle Shell setup" gentle-shell with_npm_script_allowlist gentle-shell --isolated setup
 fi
 
 if wants agents; then
@@ -730,7 +744,7 @@ if wants agents; then
   step claude   "Claude Code" claude   claude update
   step codex    "Codex"       codex    codex update
   step opencode "OpenCode"    opencode opencode upgrade
-  step gentle-shell "Gentle Shell extensions"    gentle-shell gentle-shell --isolated update --extensions
+  step gentle-shell "Gentle Shell extensions"    gentle-shell with_npm_script_allowlist gentle-shell --isolated update --extensions
   step gentle-shell "Gentle Shell model catalog" gentle-shell gentle-shell --isolated update --models
   update_herdr
 fi

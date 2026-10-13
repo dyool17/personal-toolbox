@@ -28,6 +28,19 @@ systemctl --user list-timers gentle-update.timer   # next run
 journalctl --user -u gentle-update -e               # last run
 ```
 
+### npm install-script permissions
+
+`gentle-update` allows lifecycle scripts for `gentle-pi`, `@google/genai`, and
+`protobufjs` during its direct npm installations/updates and package installation
+steps delegated to Pi and Gentle Shell. These scripts run as your user; approval
+by package name also trusts future versions. Other packages remain subject to
+npm's existing script policy. No user npm configuration is changed, and unrelated
+steps do not receive this permission.
+
+This applies when an installation/update runs; a launcher already recorded at the
+current main commit is still skipped. It does not retroactively run scripts that
+were blocked during an earlier installation.
+
 ### Roll back
 
 ```bash

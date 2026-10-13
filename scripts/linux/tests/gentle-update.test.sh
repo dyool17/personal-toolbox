@@ -7,7 +7,7 @@
 # under test is copied next to a stub gentle-rollback, which is where
 # gentle-update looks for it first.
 #
-# Usage: bash scripts/linux/tests/gentle-update.test.sh
+# Usage: bash scripts/linux/tests/gentle-update.test.sh [--scripts-only]
 # Prints one ok/FAIL line per case and exits non-zero when any case failed.
 
 set -uo pipefail
@@ -83,6 +83,7 @@ cat > "$SANDBOX/stub" <<'EOF'
 #!/usr/bin/env bash
 name="$(basename "$0")"
 printf '%s %s\n' "$name" "$*" >> "$STUB_LOG"
+printf '%s %s|%s\n' "$name" "$*" "${npm_config_allow_scripts:-}" >> "$SANDBOX/script-env.log"
 case "$name $*" in
   "npm ls -g --depth=0 --json")
     [ -e "$SANDBOX/fail-npm-ls" ] && exit 1
@@ -157,7 +158,8 @@ SHELL_SHA="1111111111111111111111111111111111111111"
 SHELL_SHA_OLD="2222222222222222222222222222222222222222"
 SHELL_COMMIT_FILE="$GENTLE_UPDATE_STATE_DIR/gentle-shell.commit"
 SHELL_LS_REMOTE="git ls-remote https://github.com/Gentleman-Programming/gentle-shell refs/heads/main"
-SHELL_INSTALL="npm install --global --allow-git=all github:Gentleman-Programming/gentle-shell#"
+SCRIPT_ALLOWLIST="gentle-pi,@google/genai,protobufjs"
+SHELL_INSTALL="npm install --global --allow-git=all --allow-scripts=$SCRIPT_ALLOWLIST github:Gentleman-Programming/gentle-shell#"
 write_ls_remote() { printf '%s\trefs/heads/main\n' "$1" > "$SANDBOX/ls-remote.out"; }
 
 DOCTOR_OK='{"features": [{"id": "inbox", "status": "ok", "readyAgents": ["claude", "pi"]}, {"id": "sessions", "status": "ok", "readyAgents": null}]}'
@@ -182,6 +184,7 @@ reset() {
   printf '%s\n' "$DOCTOR_OK" > "$SANDBOX/doctor.json"
   install_bin_dir
   : > "$STUB_LOG"
+  : > "$SANDBOX/script-env.log"
 }
 run_update() {
   OUT="$("$APP/gentle-update" "$@" 2>&1 </dev/null)"
@@ -211,7 +214,7 @@ check "the snapshot names the target" logged "gentle-rollback snapshot --reason 
 SNAP_LINE="$(first_line_of '^gentle-rollback snapshot')"
 UPDATE_LINE="$(first_line_of "$UPDATE_COMMANDS")"
 check "the snapshot is taken before the first update command" test -n "$SNAP_LINE" -a -n "$UPDATE_LINE" -a "${SNAP_LINE:-0}" -lt "${UPDATE_LINE:-0}"
-check "npm globals are updated package by package" logged "npm update -g @earendil-works/pi-coding-agent @openai/codex left-pad"
+check "npm globals are updated package by package" logged "npm update -g --allow-scripts=$SCRIPT_ALLOWLIST @earendil-works/pi-coding-agent @openai/codex left-pad"
 check "pnpm globals are updated without --latest" logged "pnpm update -g"
 check "the Pi model catalog is refreshed" logged "pi update --models"
 check "the Gentle Shell model catalog is refreshed" logged "gentle-shell --isolated update --models"
@@ -225,6 +228,24 @@ check_not "the Moshi daemon is left alone when the binary did not change" logged
 check_not "doctor is never run with --yes" grep -qE 'doctor.*--yes' "$STUB_LOG"
 check_not "no .prev backup is written" test -e "$GENTLE_UPDATE_BIN_DIR/gentle-ai.prev"
 check_not "runtimes stay out of 'all'" logged "mise upgrade --yes"
+check_not "script authorization never changes npm config" grep -q '^npm config' "$STUB_LOG"
+check_not "script authorization never writes a user npmrc" test -e "$HOME/.npmrc"
+check_eq "only the two npm mutations receive the explicit script allowlist" "2" \
+  "$(grep -cF -- "--allow-scripts=$SCRIPT_ALLOWLIST" "$STUB_LOG")"
+check_not "scripts are never blanket-authorized" grep -qE -- '--allow-scripts=(all|true|\*)($| )' "$STUB_LOG"
+for nested_install in 'pi update --all' 'gentle-shell --isolated setup' 'gentle-shell --isolated update --extensions'; do
+  check "$nested_install receives the exact script allowlist" \
+    grep -qxF "$nested_install|$SCRIPT_ALLOWLIST" "$SANDBOX/script-env.log"
+done
+check_eq "only the three nested installers inherit script permission" "3" \
+  "$(grep -cF "|$SCRIPT_ALLOWLIST" "$SANDBOX/script-env.log")"
+
+# A focused run exercises the script policy through the public update command.
+if [ "${1:-}" = --scripts-only ]; then
+  printf '\n%d script-policy case(s) failed\n' "$FAILS"
+  [ "$FAILS" -eq 0 ]
+  exit $?
+fi
 
 # --- toolchain channels ------------------------------------------------------
 
@@ -258,7 +279,7 @@ check "the main commit is resolved with git ls-remote" logged "$SHELL_LS_REMOTE"
 check "the launcher is installed from the resolved commit" logged "$SHELL_INSTALL$SHELL_SHA"
 check_eq "the installed commit is recorded" "$SHELL_SHA" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
 check_not "the registry release is no longer installed" grep -q 'gentle-pi@latest' "$STUB_LOG"
-check_not "gentle-pi is never given to npm update" grep -qE '^npm update .*gentle-pi' "$STUB_LOG"
+check_not "gentle-pi is never given to npm update" grep -qE '^npm update .* gentle-pi( |$)' "$STUB_LOG"
 check "the step is named after its source" grep -qF 'Gentle Shell launcher (gentle-shell main)' <<<"$OUT"
 RESOLVE_LINE="$(first_line_of '^git ls-remote ')"
 INSTALL_LINE="$(first_line_of '^npm install --global --allow-git=all ')"
@@ -400,7 +421,7 @@ run_update all
 check_eq "a run with holds exits 0" "0" "$RC"
 check_not "a held component is not updated" logged "claude update"
 check "a held component is listed under Skipped" grep -qF 'Claude Code — held by gentle-rollback (gentle-rollback unhold claude)' <<<"$(sed -n '/Skipped/,$p' <<<"$OUT")"
-check "held npm packages are left out of the npm update" logged "npm update -g @earendil-works/pi-coding-agent left-pad"
+check "held npm packages are left out of the npm update" logged "npm update -g --allow-scripts=$SCRIPT_ALLOWLIST @earendil-works/pi-coding-agent left-pad"
 check "other components still update" logged "opencode upgrade"
 
 reset
