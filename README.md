@@ -28,6 +28,30 @@ systemctl --user list-timers gentle-update.timer   # next run
 journalctl --user -u gentle-update -e               # last run
 ```
 
+### Run logs
+
+`gentle-update` and `gentle-reset` write one log per run, and print its path
+when the run fails:
+
+```bash
+less ~/.local/state/gentle-update/logs/latest.log
+less ~/.local/state/gentle-reset/logs/latest.log
+grep -h "finished: exit [1-9]" ~/.local/state/gentle-update/logs/*.log   # every failed step and run
+```
+
+A log holds everything the terminal showed, plus the environment the run
+started in, where each tool was resolved from, and the command, exit status and
+duration of every step. The newest 30 logs are kept per script.
+
+| Variable | Effect |
+|---|---|
+| `GENTLE_UPDATE_NO_LOG=1`, `GENTLE_RESET_NO_LOG=1` | Do not write a log. |
+| `GENTLE_UPDATE_TRACE=1`, `GENTLE_RESET_TRACE=1` | Also write a `set -x` trace (`<log>.trace`). It records every expanded value, so read it before sharing it. |
+| `GENTLE_UPDATE_LOG_DIR`, `GENTLE_RESET_LOG_DIR` | Write the logs somewhere else. |
+
+While a log is being written the tools no longer see a terminal on their
+output, so some of them print plainer progress than before.
+
 ### npm install-script permissions
 
 `gentle-update` allows lifecycle scripts for `gentle-pi`, `@google/genai`, and

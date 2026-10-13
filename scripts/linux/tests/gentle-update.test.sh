@@ -554,6 +554,63 @@ for missing in jq flock sha256sum timeout rg; do
   mv "$SANDBOX/hidden-tool" "$SYS/$missing"
 done
 
+# --- run log -----------------------------------------------------------------
+
+LOGS="$GENTLE_UPDATE_STATE_DIR/logs"
+latest_log() { readlink -f "$LOGS/latest.log"; }
+
+reset
+rm -rf "$LOGS"
+run_update all
+check_eq "a logged clean run still exits 0" "0" "$RC"
+check "a run writes a log" test -s "$(latest_log)"
+check "the log holds the terminal output" grep -q 'Claude Code' "$(latest_log)"
+check "the log records the command behind a step" grep -q "step 'Claude Code' (claude): claude update" "$(latest_log)"
+check "the log records a step's exit status" grep -qE "step 'Claude Code' finished: exit 0 in [0-9]+s" "$(latest_log)"
+check "the log records where each tool was found" grep -qF "claude -> $STUBS/claude" "$(latest_log)"
+check "the log records how the run ended" grep -qE 'finished: exit 0 after [0-9]+s' "$(latest_log)"
+check_not "the log holds no color codes" grep -q $'\033' "$(latest_log)"
+check_not "a clean run does not print the log path" grep -q 'run log:' <<<"$OUT"
+check_not "no trace is written unless asked for" test -e "$(latest_log | sed 's/\.log$/.trace/')"
+
+reset
+touch "$SANDBOX/fail-npm-install"
+run_update agents
+check_eq "a failed step still exits 1" "1" "$RC"
+check "a failed step reports its exit status" grep -q 'update failed (exit 1)' <<<"$OUT"
+check "a failed run prints the log path" grep -qF "run log: $(latest_log)" <<<"$OUT"
+check "the log records the failed step" grep -qE "step 'Gentle Shell launcher \(gentle-shell main\)' finished: exit 1" "$(latest_log)"
+check "the log records the failed run" grep -qE 'finished: exit 1 after [0-9]+s' "$(latest_log)"
+
+reset
+touch "$SANDBOX/fail-mise-env"
+run_update all
+check "the log keeps a tool's error output" grep -q 'mise: config error' "$(latest_log)"
+
+reset
+touch "$SANDBOX/break-claude"
+run_update agents
+check "the log records why a broken tool does not answer" grep -q 'claude --version: exit 1' "$(latest_log)"
+
+reset
+rm -rf "$LOGS"
+mkdir -p "$LOGS"
+for n in $(seq 10 49); do : > "$LOGS/gentle-update-20200101-0000$n-1.log"; done
+run_update plugins
+check_eq "only the newest 30 logs are kept" "30" "$(find "$LOGS" -name 'gentle-update-*.log' | wc -l)"
+check "the newest log survives the pruning" test -s "$(latest_log)"
+
+reset
+rm -rf "$LOGS"
+OUT="$(GENTLE_UPDATE_NO_LOG=1 "$APP/gentle-update" plugins 2>&1 </dev/null)"
+check_eq "GENTLE_UPDATE_NO_LOG=1 still exits 0" "0" "$?"
+check_not "GENTLE_UPDATE_NO_LOG=1 writes no log" test -e "$LOGS"
+
+reset
+OUT="$(GENTLE_UPDATE_TRACE=1 "$APP/gentle-update" plugins 2>&1 </dev/null)"
+check "GENTLE_UPDATE_TRACE=1 writes a trace next to the log" test -s "$(latest_log | sed 's/\.log$/.trace/')"
+check_not "the trace stays out of the terminal output" grep -q '^+ ' <<<"$OUT"
+
 printf '\n'
 if [ "$FAILS" -gt 0 ]; then
   printf '%d case(s) failed\n' "$FAILS"

@@ -46,9 +46,16 @@
 #
 # Each step is isolated: a failure is reported at the end and never stops the
 # remaining steps.
+#
+# Every run, dry runs included, writes a log to ~/.local/state/gentle-reset/logs
+# (the newest 30 are kept; `latest.log` points at the last one). It holds the
+# full output plus the command, exit status and duration of each step, and its
+# path is printed when a run fails. GENTLE_RESET_NO_LOG=1 turns it off;
+# GENTLE_RESET_TRACE=1 adds a `set -x` trace next to it.
 
 set -uo pipefail
 
+ARGS=("$@")
 TARGET=""
 DRY_RUN=0
 FORCE=0
@@ -63,6 +70,96 @@ warn()    { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
 skip() {
   SKIPPED+=("$1")
   warn "$1"
+}
+
+# --- run log -----------------------------------------------------------------
+
+# Every run keeps a transcript under LOG_DIR: what the terminal showed (both
+# streams, colors removed) plus log-only lines for the environment, the command
+# behind each step, its exit status and how long it took.
+LOG_DIR="${GENTLE_RESET_LOG_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gentle-reset/logs}"
+LOG_KEEP=30
+LOG_FILE=""
+LOG_PIDS=()
+STARTED=$SECONDS
+
+# Append one line to the run log only; the terminal never sees it.
+note() {
+  [ -n "$LOG_FILE" ] || return 0
+  printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG_FILE"
+}
+
+# Start the run log: start_log <arguments the script was started with>.
+# A log that cannot be written is reported and never stops the run.
+start_log() {
+  [ "${GENTLE_RESET_NO_LOG:-}" = 1 ] && return 0
+  local file old invoker=non-interactive script
+  file="$LOG_DIR/gentle-reset-$(date '+%Y%m%d-%H%M%S')-$$.log"
+  if ! { mkdir -p "$LOG_DIR" && : >"$file"; } 2>/dev/null; then
+    warn "cannot write a run log under $LOG_DIR; continuing without one"
+    return 0
+  fi
+  LOG_FILE="$file"
+  ln -sfn "${file##*/}" "$LOG_DIR/latest.log"
+  # Log names sort by start time, so the oldest ones are the ones to drop.
+  find "$LOG_DIR" -maxdepth 1 -name 'gentle-reset-*.log' | sort -r | tail -n +$((LOG_KEEP + 1)) \
+    | while read -r old; do rm -f "$old" "${old%.log}.trace"; done
+
+  # INVOCATION_ID alone does not mean a timer: a terminal started by a systemd
+  # user unit hands it down to every shell inside it.
+  if [ -t 1 ]; then invoker=terminal; elif [ -n "${INVOCATION_ID:-}" ]; then invoker="non-interactive, under a systemd unit"; fi
+  script="$(readlink -f "$0")"
+  {
+    printf 'gentle-reset run log\n'
+    printf '  started  %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
+    printf '  command  %s\n' "$0 $*"
+    printf '  script   %s (sha256 %s)\n' "$script" "$(sha256sum "$script" 2>/dev/null | cut -c1-12)"
+    printf '  invoker  %s\n' "$invoker"
+    printf '  system   %s, bash %s\n' "$(uname -srm)" "$BASH_VERSION"
+    printf '  cwd      %s\n' "$PWD"
+    printf '  PATH     %s\n\n' "$PATH"
+  } >>"$LOG_FILE"
+
+  # The terminal keeps both streams apart; the log gets a copy of each. tee
+  # ignores Ctrl-C so an interrupted run still logs its last lines.
+  exec 6>&1 7>&2
+  exec 2> >(exec tee -i -a "$LOG_FILE" >&2)
+  LOG_PIDS+=("$!")
+  exec > >(exec tee -i -a "$LOG_FILE")
+  LOG_PIDS+=("$!")
+  trap finish_log EXIT
+}
+
+# GENTLE_RESET_TRACE=1 also writes a `set -x` trace next to the log. It is opt-in
+# because a trace records every expanded value, including whatever a command
+# line carries.
+start_trace() {
+  [ -n "$LOG_FILE" ] && [ "${GENTLE_RESET_TRACE:-}" = 1 ] || return 0
+  exec 8>"${LOG_FILE%.log}.trace" || return 0
+  BASH_XTRACEFD=8
+  PS4='+ ${EPOCHREALTIME} line ${LINENO} ${FUNCNAME[0]:-main}: '
+  set -x
+}
+
+# Close the run log on exit, whatever the exit path was.
+finish_log() {
+  local status=$? pid tries=0
+  trap - EXIT
+  { set +x; } 2>/dev/null
+  # Give the terminal back and let the transcript drain. A daemon started by a
+  # step can keep the pipes open, so the wait is bounded.
+  exec 1>&6 2>&7 6>&- 7>&-
+  for pid in "${LOG_PIDS[@]}"; do
+    while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do
+      sleep 0.1
+      tries=$((tries + 1))
+    done
+  done
+  note "finished: exit $status after $((SECONDS - STARTED))s"
+  sed -i 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOG_FILE" 2>/dev/null
+  if [ "$status" -ne 0 ]; then
+    printf 'gentle-reset: run log: %s\n' "$LOG_FILE" >&2
+  fi
 }
 
 # Perform one mutation, or describe it under --dry-run.
@@ -86,12 +183,17 @@ step() {
   fi
 
   printf '\n\033[1m%s\033[0m\n' "$name"
-  if "$@"; then
+  local started=$SECONDS status
+  note "step '$name': $*"
+  "$@"
+  status=$?
+  if [ "$status" -eq 0 ]; then
     ok "$name"
   else
     FAILED+=("$name")
-    warn "$name — failed"
+    warn "$name — failed (exit $status)"
   fi
+  note "step '$name' finished: exit $status in $((SECONDS - started))s"
 }
 
 # Delete one regenerable path, reporting what it was worth.
@@ -313,6 +415,10 @@ while [ $# -gt 0 ]; do
 done
 
 TARGET="${TARGET:-all}"
+
+start_log "${ARGS[@]}"
+start_trace
+note "target=$TARGET dry_run=$DRY_RUN force=$FORCE HERDR_ENV=${HERDR_ENV:+set} TMPDIR=${TMPDIR:-}"
 
 # herdr will not stop its own server from inside one of its sessions, so that
 # one step is reported as skipped rather than aborting the whole run. A dry run

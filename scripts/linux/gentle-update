@@ -45,6 +45,12 @@
 #     held, and the run is reported as failed. When it cannot be rolled back it
 #     is held anyway and reported for what happened.
 #
+# Every run writes a log to ~/.local/state/gentle-update/logs (the newest 30
+# are kept; `latest.log` points at the last one). It holds the full output plus
+# the command, exit status and duration of each step, and its path is printed
+# when a run fails. GENTLE_UPDATE_NO_LOG=1 turns it off; GENTLE_UPDATE_TRACE=1
+# adds a `set -x` trace next to it.
+#
 # npm install scripts are allowed only for gentle-pi, @google/genai and
 # protobufjs during direct npm updates and Pi/Gentle Shell package installs.
 # This trusts future versions of these names, not every package, and never
@@ -107,6 +113,108 @@ skip() {
   warn "$1"
 }
 
+# --- run log -----------------------------------------------------------------
+
+# Every run keeps a transcript under LOG_DIR: what the terminal showed (both
+# streams, colors removed) plus log-only lines for the environment, the command
+# behind each step, its exit status and how long it took.
+LOG_DIR="${GENTLE_UPDATE_LOG_DIR:-$STATE/logs}"
+LOG_KEEP=30
+LOG_FILE=""
+LOG_PIDS=()
+STARTED=$SECONDS
+
+# Append one line to the run log only; the terminal never sees it.
+note() {
+  [ -n "$LOG_FILE" ] || return 0
+  printf '[%s] %s\n' "$(date '+%H:%M:%S')" "$*" >>"$LOG_FILE"
+}
+
+# Start the run log: start_log <arguments the script was started with>.
+# A log that cannot be written is reported and never stops the run.
+start_log() {
+  [ "${GENTLE_UPDATE_NO_LOG:-}" = 1 ] && return 0
+  local file old invoker=non-interactive script
+  file="$LOG_DIR/gentle-update-$(date '+%Y%m%d-%H%M%S')-$$.log"
+  if ! { mkdir -p "$LOG_DIR" && : >"$file"; } 2>/dev/null; then
+    warn "cannot write a run log under $LOG_DIR; continuing without one"
+    return 0
+  fi
+  LOG_FILE="$file"
+  ln -sfn "${file##*/}" "$LOG_DIR/latest.log"
+  # Log names sort by start time, so the oldest ones are the ones to drop.
+  find "$LOG_DIR" -maxdepth 1 -name 'gentle-update-*.log' | sort -r | tail -n +$((LOG_KEEP + 1)) \
+    | while read -r old; do rm -f "$old" "${old%.log}.trace"; done
+
+  # INVOCATION_ID alone does not mean a timer: a terminal started by a systemd
+  # user unit hands it down to every shell inside it.
+  if [ -t 1 ]; then invoker=terminal; elif [ -n "${INVOCATION_ID:-}" ]; then invoker="non-interactive, under a systemd unit"; fi
+  script="$(readlink -f "$0")"
+  {
+    printf 'gentle-update run log\n'
+    printf '  started  %s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')"
+    printf '  command  %s\n' "$0 $*"
+    printf '  script   %s (sha256 %s)\n' "$script" "$(sha256sum "$script" 2>/dev/null | cut -c1-12)"
+    printf '  invoker  %s\n' "$invoker"
+    printf '  system   %s, bash %s\n' "$(uname -srm)" "$BASH_VERSION"
+    printf '  cwd      %s\n' "$PWD"
+    printf '  PATH     %s\n\n' "$PATH"
+  } >>"$LOG_FILE"
+
+  # The terminal keeps both streams apart; the log gets a copy of each. tee
+  # ignores Ctrl-C so an interrupted run still logs its last lines.
+  exec 6>&1 7>&2
+  exec 2> >(exec tee -i -a "$LOG_FILE" >&2)
+  LOG_PIDS+=("$!")
+  exec > >(exec tee -i -a "$LOG_FILE")
+  LOG_PIDS+=("$!")
+  trap finish_log EXIT
+}
+
+# GENTLE_UPDATE_TRACE=1 also writes a `set -x` trace next to the log. It is opt-in
+# because a trace records every expanded value, including whatever a command
+# line carries.
+start_trace() {
+  [ -n "$LOG_FILE" ] && [ "${GENTLE_UPDATE_TRACE:-}" = 1 ] || return 0
+  exec 8>"${LOG_FILE%.log}.trace" || return 0
+  BASH_XTRACEFD=8
+  PS4='+ ${EPOCHREALTIME} line ${LINENO} ${FUNCNAME[0]:-main}: '
+  set -x
+}
+
+# Close the run log on exit, whatever the exit path was.
+finish_log() {
+  local status=$? pid tries=0
+  trap - EXIT
+  { set +x; } 2>/dev/null
+  # Give the terminal back and let the transcript drain. A daemon started by a
+  # step can keep the pipes open, so the wait is bounded.
+  exec 1>&6 2>&7 6>&- 7>&-
+  for pid in "${LOG_PIDS[@]}"; do
+    while kill -0 "$pid" 2>/dev/null && [ "$tries" -lt 20 ]; do
+      sleep 0.1
+      tries=$((tries + 1))
+    done
+  done
+  note "finished: exit $status after $((SECONDS - STARTED))s"
+  sed -i 's/\x1b\[[0-9;]*[A-Za-z]//g' "$LOG_FILE" 2>/dev/null
+  if [ "$status" -ne 0 ]; then
+    printf 'gentle-update: run log: %s\n' "$LOG_FILE" >&2
+  fi
+}
+
+# Log-only: the environment the steps run in. A tool resolved from the wrong
+# directory is the usual reason an update "worked" and changed nothing.
+note_environment() {
+  [ -n "$LOG_FILE" ] || return 0
+  local t
+  note "PATH after environment setup: $PATH"
+  note "held components: $(find "$STATE/holds" -mindepth 1 -printf '%f ' 2>/dev/null)"
+  for t in "${SMOKE_TOOLS[@]}" node npm pnpm go git jq; do
+    note "  $t -> $(command -v "$t" 2>/dev/null || echo 'not on PATH')"
+  done
+}
+
 # A component is held when gentle-rollback restored it (or the user asked for
 # it with `gentle-rollback hold`). Updating it again would undo the rollback.
 held() { [ -e "$STATE/holds/$1" ]; }
@@ -130,14 +238,19 @@ step() {
   fi
 
   printf '\n\033[1m%s\033[0m\n' "$name"
+  local started=$SECONDS status
+  note "step '$name' ($key): $*"
   # The lock descriptor is closed for the step: a daemon started by an updater
   # would otherwise inherit it and keep every later run locked out.
-  if "$@" 9>&-; then
+  "$@" 9>&-
+  status=$?
+  if [ "$status" -eq 0 ]; then
     ok "$name"
   else
     FAILED+=("$name")
-    warn "$name — update failed"
+    warn "$name — update failed (exit $status)"
   fi
+  note "step '$name' finished: exit $status in $((SECONDS - started))s"
 }
 
 version_of() {
@@ -430,6 +543,7 @@ update_moshi_hook() {
   bin="$(command -v moshi-hook)" || return 1
   before_sha="$(sha256sum "$bin" | cut -d' ' -f1)"
   before_doc="$(moshi-hook doctor --json 2>/dev/null </dev/null)"
+  note "moshi-hook doctor before: $before_doc"
   # Claude Code, Codex and Pi are always wired. Any other agent gets its hooks
   # reinstalled only when it already has them; an update must never wire Moshi
   # into an agent the user did not set up.
@@ -480,6 +594,7 @@ update_moshi_hook() {
     sleep 1
     waited=$((waited + 1))
   done
+  note "moshi-hook doctor after (waited ${waited}s): $after_doc"
   if [ -n "$regressed" ]; then
     warn "moshi-hook doctor: no longer ok after the update: $regressed"
     status=1
@@ -576,6 +691,15 @@ sync_gentle_shell_mcp() {
 
 answers_version() { timeout 20 "$1" --version >/dev/null 2>&1 </dev/null; }
 
+# Log-only: what a tool that stopped answering says now, and which copy it is.
+note_version_failure() {
+  [ -n "$LOG_FILE" ] || return 0
+  local out status
+  out="$(timeout 20 "$1" --version 2>&1 </dev/null)"
+  status=$?
+  note "$1 --version: exit $status ($(command -v "$1" 2>/dev/null || echo 'not on PATH')): ${out:0:2000}"
+}
+
 # Hold a component that could not be put back, so the next daily run does not
 # reinstall the same broken release (possibly through the broken tool itself).
 hold_broken() {
@@ -595,6 +719,7 @@ smoke_check() {
   for tool in "${WORKED_BEFORE[@]}"; do
     answers_version "$tool" && continue
     warn "$tool no longer runs after the update"
+    note_version_failure "$tool"
 
     if [ -z "$SNAPSHOT_ID" ]; then
       FAILED+=("$tool broke after the update; not rolled back (no snapshot)")
@@ -653,6 +778,9 @@ done
 
 wants() { [ "$TARGET" = all ] || [ "$TARGET" = "$1" ]; }
 
+# Started before the lock is taken, so the log writers never inherit it.
+start_log "$@"
+
 mkdir -p "$BIN_DIR"
 
 # Under systemd (or any shell that mise did not activate) node, npm, pnpm, go
@@ -682,6 +810,11 @@ export PATH
 # Run every step from $HOME, so a project-local .pi directory or package
 # manifest in the directory this was started from never takes part.
 cd "$HOME" || exit 1
+
+note_environment
+# Only from here on: the environment mise printed above may carry secrets, and
+# a trace would write every one of them to disk.
+start_trace
 
 # One lock for gentle-update and gentle-rollback, held on descriptor 9 until
 # this process exits. A run that finds it taken has nothing to do: the other

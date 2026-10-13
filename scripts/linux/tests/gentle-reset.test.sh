@@ -105,6 +105,41 @@ seed
 bash "$RESET" state >/dev/null 2>&1
 check     "other targets leave temp scratch alone"   test -d "$ROOT/stale-verify.abc"
 
+# --- run log -----------------------------------------------------------------
+
+LOGS="$HOME/.local/state/gentle-reset/logs"
+latest_log() { readlink -f "$LOGS/latest.log"; }
+
+seed
+rm -rf "$LOGS"
+bash "$RESET" caches > "$SANDBOX/out.log" 2>&1
+check     "a run writes a log"                       test -s "$(latest_log)"
+check     "the log holds the terminal output"        grep -q "stale-verify.abc" "$(latest_log)"
+check     "the log records the command of a step"    grep -q "step 'pnpm store': reset_pnpm_store" "$(latest_log)"
+check     "the log records a step's exit status"     grep -qE "step 'pnpm store' finished: exit 0 in [0-9]+s" "$(latest_log)"
+check     "the log records how the run ended"        grep -qE 'finished: exit 0 after [0-9]+s' "$(latest_log)"
+check_not "the log holds no color codes"             grep -q $'\033' "$(latest_log)"
+check_not "a clean run does not print the log path"  grep -q 'run log:' "$SANDBOX/out.log"
+
+# A failing npm makes the npm caches step fail.
+seed
+printf '#!/usr/bin/env bash\necho "npm ERR! cache is locked" >&2\nexit 7\n' > "$SANDBOX/npm-fail"
+chmod +x "$SANDBOX/npm-fail"
+ln -sf "$SANDBOX/npm-fail" "$STUBS/npm"
+bash "$RESET" caches > "$SANDBOX/out.log" 2>&1
+STATUS=$?
+ln -sf "$SANDBOX/stub" "$STUBS/npm"
+check     "a failed step still exits 1"              test "$STATUS" -eq 1
+check     "a failed step reports its exit status"    grep -q "npm caches — failed (exit 1)" "$SANDBOX/out.log"
+check     "a failed run prints the log path"         grep -qF "run log: $(latest_log)" "$SANDBOX/out.log"
+check     "the log keeps a tool's error output"      grep -q "npm ERR! cache is locked" "$(latest_log)"
+check     "the log records the failed step"          grep -qE "step 'npm caches' finished: exit 1" "$(latest_log)"
+
+seed
+rm -rf "$LOGS"
+GENTLE_RESET_NO_LOG=1 bash "$RESET" state >/dev/null 2>&1
+check_not "GENTLE_RESET_NO_LOG=1 writes no log"      test -e "$LOGS"
+
 if [ "$FAILS" -gt 0 ]; then
   printf '\n%s case(s) failed\n' "$FAILS"
   exit 1
