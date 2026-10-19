@@ -51,10 +51,11 @@
 # when a run fails. GENTLE_UPDATE_NO_LOG=1 turns it off; GENTLE_UPDATE_TRACE=1
 # adds a `set -x` trace next to it.
 #
-# npm install scripts are allowed only for gentle-pi, @google/genai and
-# protobufjs during direct npm updates and Pi/Gentle Shell package installs.
-# This trusts future versions of these names, not every package, and never
-# changes the user's npm configuration.
+# npm scripts: global installs use a command-local --allow-scripts whitelist.
+# Pi/Gentle Shell installs are PROJECT scoped (npm --prefix <home>/npm):
+# their whitelist belongs in the project package.json#allowScripts
+# (which overrides .npmrc), NOT in npm_config_* environment.
+# Existing explicit denials are preserved; no global npmrc changes.
 #
 # Usage:
 #   gentle-update [all|agents|toolchain|plugins|packages|runtimes]
@@ -77,7 +78,7 @@ GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@main"
 ENGRAM_PKG="github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 # The npm package name remains gentle-pi; it installs the gentle-shell command.
 GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
-# Command-local lifecycle permission; never persist it in the user's npmrc.
+# Intentionally narrow: inspect dependency scripts before adding more names.
 NPM_SCRIPT_ALLOWLIST="gentle-pi,@google/genai,protobufjs"
 # The launcher is installed from the main branch of its repository instead of
 # the registry release. npm does not record the commit of a git-installed
@@ -106,11 +107,20 @@ SNAPSHOT_ID=""
 bold()    { printf '\n\033[1m%s\033[0m\n' "$*"; }
 heading() { printf '\n\033[1;35m── %s ──\033[0m\n' "$*"; }
 ok()      { printf '\033[32m✓\033[0m %s\n' "$*"; }
-warn()    { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+# Warnings go to a file, not an array: warn also runs inside subshells and
+# pipelines, whose array changes would be lost before the summary.
+WARN_FILE="$(mktemp "${TMPDIR:-/tmp}/gentle-update-warn.XXXXXX" 2>/dev/null || true)"
+print_warn() { printf '\033[33m!\033[0m %s\n' "$*" >&2; }
+warn() {
+  print_warn "$@"
+  [ -n "$WARN_FILE" ] && printf '%s\n' "$*" >>"$WARN_FILE"
+  return 0
+}
 
+# Skips are listed under their own heading, so they are not warnings too.
 skip() {
   SKIPPED+=("$1")
-  warn "$1"
+  print_warn "$1"
 }
 
 # --- run log -----------------------------------------------------------------
@@ -186,6 +196,7 @@ start_trace() {
 finish_log() {
   local status=$? pid tries=0
   trap - EXIT
+  [ -n "$WARN_FILE" ] && rm -f "$WARN_FILE"
   { set +x; } 2>/dev/null
   # Give the terminal back and let the transcript drain. A daemon started by a
   # step can keep the pipes open, so the wait is bounded.
@@ -258,10 +269,22 @@ version_of() {
   "$1" --version 2>/dev/null | head -1 | tr -d '\r' || echo "unknown"
 }
 
+REPORTED_TOOLS=(claude codex opencode pi gentle-shell herdr gentle-ai engram mise qmd)
+declare -A VERSION_BEFORE=()
+
+# The first call records each version; later calls mark what changed since.
 report_versions() {
-  local t
-  for t in claude codex opencode pi gentle-shell herdr gentle-ai engram mise qmd; do
-    printf '  %-12s %s\n' "$t" "$(version_of "$t")"
+  local t v
+  for t in "${REPORTED_TOOLS[@]}"; do
+    v="$(version_of "$t")"
+    if [ -z "${VERSION_BEFORE[$t]+set}" ]; then
+      VERSION_BEFORE[$t]="$v"
+      printf '  %-12s %s\n' "$t" "$v"
+    elif [ "${VERSION_BEFORE[$t]}" != "$v" ]; then
+      printf '  %-12s %s -> %s  (upgraded)\n' "$t" "${VERSION_BEFORE[$t]}" "$v"
+    else
+      printf '  %-12s %s\n' "$t" "$v"
+    fi
   done
 }
 
@@ -391,10 +414,75 @@ install_gentle_shell() {
   printf '  installed main commit %s\n' "${sha:0:12}"
 }
 
-# Pi and Gentle Shell spawn npm internally. Pass the same narrow policy to
-# those installers only, without exporting permission to unrelated steps.
-with_npm_script_allowlist() {
-  env npm_config_allow_scripts="$NPM_SCRIPT_ALLOWLIST" "$@"
+# Pi and Gentle Shell spawn npm --prefix <home>/npm for project-scoped
+# installs. npm 12 rejects allow-scripts arriving through npm_config_* env.
+# A root project package.json#allowScripts takes priority over .npmrc: apply
+# the *narrowly scoped* approvals there without touching explicit denials.
+# Back up package.json before the first change. Clean up only the exact
+# .npmrc entry introduced by our previous updater/preflight version.
+configure_pi_npm_policy() {
+  local dir="$1/npm" file="$1/npm/package.json" rc="$1/npm/.npmrc" tmp
+
+  mkdir -p "$dir" || return 1
+  if [ ! -f "$file" ]; then
+    # A Pi home may not yet be initialized. Do not fabricate package.json:
+    # Pi/Gentle Shell are responsible for creating their project metadata.
+    warn "npm project not initialized yet: $dir (skipping script approvals)"
+    return 0
+  fi
+  if [ -L "$file" ]; then
+    warn "refusing symlinked npm package metadata: $file"
+    return 1
+  fi
+  if ! jq -e 'type == "object" and ((.allowScripts == null) or (.allowScripts | type == "object"))' "$file" >/dev/null 2>&1; then
+    warn "invalid package.json or allowScripts policy: $file"
+    return 1
+  fi
+
+  # Existing false entries, including version-specific denials, remain as-is.
+  # If a package was explicitly denied by name, do not override that denial.
+  if ! jq -e --arg allow "$NPM_SCRIPT_ALLOWLIST" '
+      (.allowScripts // {}) as $a
+      | all(($allow | split(","))[]; $a[.] != null)
+    ' "$file" >/dev/null 2>&1; then
+    tmp="$(mktemp "${file}.tmp.XXXXXX")" || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! jq --arg allow "$NPM_SCRIPT_ALLOWLIST" '
+      .allowScripts = ((.allowScripts // {}) as $a
+        | reduce ($allow | split(",")[]) as $pkg ($a;
+            if has($pkg) then . else . + {($pkg): true} end))
+    ' "$file" > "$tmp"; then
+      rm -f "$tmp"
+      return 1
+    fi
+    if [ ! -e "$file.gentle-update.bak" ]; then
+      cp -p -- "$file" "$file.gentle-update.bak" || { rm -f "$tmp"; return 1; }
+    fi
+    mv -f -- "$tmp" "$file" || { rm -f "$tmp"; return 1; }
+    ok "npm package allowScripts policy: $file"
+  fi
+
+  # The former version wrote this single .npmrc setting. It is now ignored
+  # because package.json defines allowScripts; remove only our exact line.
+  if [ -f "$rc" ] && [ ! -L "$rc" ] && grep -Fqx "allow-scripts=$NPM_SCRIPT_ALLOWLIST" "$rc"; then
+    tmp="$(mktemp "${rc}.tmp.XXXXXX")" || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! awk -v target="allow-scripts=$NPM_SCRIPT_ALLOWLIST" '$0 != target' "$rc" > "$tmp"; then
+      rm -f "$tmp"
+      return 1
+    fi
+    if [ ! -e "$rc.gentle-update.bak" ]; then
+      cp -p -- "$rc" "$rc.gentle-update.bak" || { rm -f "$tmp"; return 1; }
+    fi
+    mv -f -- "$tmp" "$rc" || { rm -f "$tmp"; return 1; }
+    ok "removed obsolete project .npmrc allow-scripts entry: $rc"
+  fi
+}
+
+# Sanitize inherited env policy for CLI commands that invoke project npm.
+# Their package.json owns the whitelist; never export it into npm_config_*.
+run_pi_scoped() {
+  env -u npm_config_allow_scripts -u NPM_CONFIG_ALLOW_SCRIPTS "$@"
 }
 
 # --- agents ------------------------------------------------------------------
@@ -419,14 +507,23 @@ update_herdr() {
 update_claude_plugins() {
   claude plugin marketplace update || return 1
 
-  local plugin status=0
-  while read -r plugin; do
+  local listing plugin status=0 managed=0
+  # A failed list must not masquerade as an empty set of plugins.
+  listing="$(claude plugin list)" || return 1
+  while IFS= read -r plugin; do
     [ -n "$plugin" ] || continue
+    case "$plugin" in
+      *@inline)
+        printf '  skipping %s (session-local --plugin-dir, no marketplace)\n' "$plugin"
+        continue
+        ;;
+    esac
+    managed=$((managed + 1))
     printf '  updating %s\n' "$plugin"
     claude plugin update "$plugin" || status=1
-  done < <(claude plugin list 2>/dev/null | rg -o '[A-Za-z0-9_-]+@[A-Za-z0-9_-]+')
-
-  return $status
+  done < <(printf '%s\n' "$listing" | rg -o '[A-Za-z0-9_-]+@[A-Za-z0-9_-]+' | sort -u)
+  [ "$managed" -gt 0 ] || printf '  no marketplace-managed plugins found\n'
+  return "$status"
 }
 
 # --- packages ----------------------------------------------------------------
@@ -815,6 +912,9 @@ note_environment
 # Only from here on: the environment mise printed above may carry secrets, and
 # a trace would write every one of them to disk.
 start_trace
+# A user shell may have inherited npm's one-off install policy. Project npm
+# commands must not inherit it; global npm commands use explicit CLI flags.
+unset npm_config_allow_scripts NPM_CONFIG_ALLOW_SCRIPTS
 
 # One lock for gentle-update and gentle-rollback, held on descriptor 9 until
 # this process exits. A run that finds it taken has nothing to do: the other
@@ -855,6 +955,18 @@ else
   exit 1
 fi
 
+if wants agents || wants toolchain; then
+  heading "Pi / Gentle Shell npm project policy"
+  # Both Pi homes use npm --prefix, so set policy BEFORE Pi update / setup.
+  # Package-local package.json#allowScripts, never user-wide npm policy.
+  for home in "${PI_HOMES[@]}"; do
+    if ! configure_pi_npm_policy "$home"; then
+      FAILED+=("npm project policy: $home")
+      warn "failed to configure npm install-script policy for $home"
+    fi
+  done
+fi
+
 if wants agents || wants toolchain || wants packages; then
   heading "Gentle Shell standalone launcher"
   step gentle-shell "Gentle Shell launcher (gentle-shell main)" npm install_gentle_shell
@@ -865,11 +977,11 @@ if wants agents || wants toolchain; then
   if wants agents; then
     # --all also refreshes the packages the plain `pi` home declares, so it
     # never lags behind the isolated Gentle Shell home.
-    step pi "PATH Pi runtime + extensions" pi with_npm_script_allowlist pi update --all
+    step pi "PATH Pi runtime + extensions" pi run_pi_scoped pi update --all
     # --all does not touch the model catalogs; those have their own flag.
     step pi "Pi model catalog" pi pi update --models
   fi
-  step gentle-shell "Gentle Shell setup" gentle-shell with_npm_script_allowlist gentle-shell --isolated setup
+  step gentle-shell "Gentle Shell setup" gentle-shell run_pi_scoped gentle-shell --isolated setup
 fi
 
 if wants agents; then
@@ -877,7 +989,7 @@ if wants agents; then
   step claude   "Claude Code" claude   claude update
   step codex    "Codex"       codex    codex update
   step opencode "OpenCode"    opencode opencode upgrade
-  step gentle-shell "Gentle Shell extensions"    gentle-shell with_npm_script_allowlist gentle-shell --isolated update --extensions
+  step gentle-shell "Gentle Shell extensions"    gentle-shell run_pi_scoped gentle-shell --isolated update --extensions
   step gentle-shell "Gentle Shell model catalog" gentle-shell gentle-shell --isolated update --models
   update_herdr
 fi
@@ -924,8 +1036,14 @@ if [ ${#SKIPPED[@]} -gt 0 ]; then
   printf '  • %s\n' "${SKIPPED[@]}"
 fi
 
+if [ -s "$WARN_FILE" ]; then
+  bold "Warnings"
+  awk '!seen[$0]++ { print "  • " $0 }' "$WARN_FILE"
+fi
+[ -n "$WARN_FILE" ] && rm -f "$WARN_FILE"
+
 if [ ${#FAILED[@]} -gt 0 ]; then
-  bold "Failed"
+  bold "Errors"
   printf '  • %s\n' "${FAILED[@]}"
   printf '\nRestart your agents once the failures above are resolved.\n'
   exit 1

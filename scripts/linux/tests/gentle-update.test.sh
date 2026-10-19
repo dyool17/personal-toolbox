@@ -234,11 +234,28 @@ check_eq "only the two npm mutations receive the explicit script allowlist" "2" 
   "$(grep -cF -- "--allow-scripts=$SCRIPT_ALLOWLIST" "$STUB_LOG")"
 check_not "scripts are never blanket-authorized" grep -qE -- '--allow-scripts=(all|true|\*)($| )' "$STUB_LOG"
 for nested_install in 'pi update --all' 'gentle-shell --isolated setup' 'gentle-shell --isolated update --extensions'; do
-  check "$nested_install receives the exact script allowlist" \
-    grep -qxF "$nested_install|$SCRIPT_ALLOWLIST" "$SANDBOX/script-env.log"
+  check "$nested_install runs without an inherited npm script policy" \
+    grep -qxF "$nested_install|" "$SANDBOX/script-env.log"
 done
-check_eq "only the three nested installers inherit script permission" "3" \
-  "$(grep -cF "|$SCRIPT_ALLOWLIST" "$SANDBOX/script-env.log")"
+check_eq "no command inherits npm script permission through the environment" "0" \
+  "$(grep -cvE '\|$' "$SANDBOX/script-env.log")"
+
+# Pi homes keep their script approvals in their own npm project.
+reset
+mkdir -p "$PI_CODING_AGENT_DIR/npm"
+printf '%s\n' '{"name":"pi-home","allowScripts":{"protobufjs":false}}' > "$PI_CODING_AGENT_DIR/npm/package.json"
+printf '%s\n' "allow-scripts=$SCRIPT_ALLOWLIST" > "$PI_CODING_AGENT_DIR/npm/.npmrc"
+OUT="$(npm_config_allow_scripts=all "$APP/gentle-update" agents 2>&1 </dev/null)"; RC=$?
+check_eq "a run with Pi npm projects exits 0" "0" "$RC"
+check_eq "the Pi project approves the allowlisted packages" '{"gentle-pi":true,"@google/genai":true}' \
+  "$(jq -c '.allowScripts | del(.protobufjs)' "$PI_CODING_AGENT_DIR/npm/package.json")"
+check_eq "an explicit denial in the Pi project is kept" "false" \
+  "$(jq -c '.allowScripts.protobufjs' "$PI_CODING_AGENT_DIR/npm/package.json")"
+check "the original package.json is backed up" test -f "$PI_CODING_AGENT_DIR/npm/package.json.gentle-update.bak"
+check_not "the obsolete .npmrc entry is removed" grep -qF allow-scripts "$PI_CODING_AGENT_DIR/npm/.npmrc"
+check_not "an inherited npm script policy never reaches nested installers" grep -qE "^(pi update --all|gentle-shell --isolated (setup|update --extensions))\|all" "$SANDBOX/script-env.log"
+check "an uninitialized Pi project is listed under Warnings" \
+  grep -qF "npm project not initialized yet: $GENTLE_SHELL_HOME/npm" <<<"$(sed -n '/Warnings/,$p' <<<"$OUT")"
 
 # A focused run exercises the script policy through the public update command.
 if [ "${1:-}" = --scripts-only ]; then
@@ -317,7 +334,7 @@ for unresolved in exit-status empty-output malformed-output; do
   esac
   run_update agents
   check_eq "unresolved main ($unresolved) fails the run" "1" "$RC"
-  check "unresolved main ($unresolved) is listed under Failed" grep -q 'Gentle Shell launcher' <<<"$(sed -n '/Failed/,$p' <<<"$OUT")"
+  check "unresolved main ($unresolved) is listed under Errors" grep -q 'Gentle Shell launcher' <<<"$(sed -n '/Errors/,$p' <<<"$OUT")"
   check_not "unresolved main ($unresolved) installs nothing" grep -q '^npm install --global' "$STUB_LOG"
   check_eq "unresolved main ($unresolved) keeps the recorded commit" "$SHELL_SHA_OLD" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
   check "unresolved main ($unresolved) still updates other tools" logged "claude update"
@@ -523,7 +540,7 @@ reset
 touch "$SANDBOX/fail-npm-ls"
 run_update packages
 check_eq "a failing npm listing fails the run" "1" "$RC"
-check "a failing npm listing is listed under Failed" grep -q 'npm globals' <<<"$(sed -n '/Failed/,$p' <<<"$OUT")"
+check "a failing npm listing is listed under Errors" grep -q 'npm globals' <<<"$(sed -n '/Errors/,$p' <<<"$OUT")"
 check_not "a failing npm listing updates no npm package" grep -q '^npm update' "$STUB_LOG"
 
 reset
