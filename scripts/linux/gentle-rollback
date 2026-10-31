@@ -15,9 +15,9 @@
 #                             installer pinned to that version.
 #   pi gentle-shell           The npm global version plus a whitelist of files
 #                             from the Pi home (settings, extensions, lockfile).
-#                             gentle-shell also records the git commit its
-#                             launcher was installed from, because npm reports
-#                             the same version for every commit of a branch.
+#                             A gentle-shell launcher installed from git also
+#                             records its commit, because npm reports the same
+#                             version for every commit of a branch.
 #   codex npm-globals         npm global versions.
 #   pnpm-globals              pnpm global versions.
 #   claude-plugins            installed_plugins.json.
@@ -36,8 +36,8 @@
 #   snapshots/<id>/   one directory per snapshot
 #   store/<sha256>    binaries, shared between snapshots
 #   holds/<component> one file per held component
-#   gentle-shell.commit  commit the Gentle Shell launcher is installed from,
-#                        written by gentle-update and by a restore
+#   gentle-shell.commit  commit of a Gentle Shell launcher installed from git,
+#                        written by a restore and removed by gentle-update
 #   lock              flock shared with gentle-update
 #
 # Usage:
@@ -89,9 +89,9 @@ CREDENTIAL_EXCLUDES=(--exclude=auth.json --exclude='*.token' --exclude=.env
 PI_NPM_PACKAGE="@earendil-works/pi-coding-agent"
 # The npm package name remains gentle-pi; it installs the gentle-shell command.
 GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
-# gentle-update installs the launcher from a commit of this repository and
-# records that commit here. npm does not record it, so this file is the only
-# way to tell two installs of the same version apart.
+# Snapshots can hold a launcher installed from a commit of this repository.
+# npm does not record that commit, so this file is the only way to tell two
+# installs of the same version apart.
 GENTLE_SHELL_GIT_SPEC="github:Gentleman-Programming/gentle-shell"
 GENTLE_SHELL_COMMIT_FILE="$STATE/gentle-shell.commit"
 CODEX_NPM_PACKAGE="@openai/codex"
@@ -250,7 +250,7 @@ pkg_changes() {
 
 # The launcher commit recorded in <file>, or nothing when the file is missing
 # or does not hold a full commit id. A snapshot taken before the launcher
-# followed main has no such file.
+# followed main, or after it moved back to releases, has no such file.
 commit_in() {
   local sha=""
   [ -f "$1" ] || return 0
@@ -639,7 +639,7 @@ restore_packages() {
 
 # Reinstall the Gentle Shell launcher the way the snapshot recorded it: from
 # its commit when there is one, from the registry version otherwise (snapshots
-# taken before the launcher followed main). The recorded commit is dropped
+# of a launcher on a release). The recorded commit is dropped
 # before the reinstall and written back only after it succeeded: a restore
 # that fails or is interrupted leaves no record, and gentle-update reinstalls
 # when there is none instead of trusting a commit that may not be installed.

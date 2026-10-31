@@ -92,11 +92,6 @@ case "$name $*" in
   "npm install --global "*)
     [ -e "$SANDBOX/fail-npm-install" ] && exit 1
     ;;
-  "git ls-remote "*)
-    # Canned answer for the Gentle Shell main branch; never reaches the network.
-    [ -e "$SANDBOX/fail-git-ls-remote" ] && exit 128
-    cat "$SANDBOX/ls-remote.out"
-    ;;
   "mise env -s bash")
     if [ -e "$SANDBOX/fail-mise-env" ]; then echo "mise: config error" >&2; exit 1; fi
     if [ ! -e "$SANDBOX/empty-mise-env" ]; then echo "export GENTLE_TEST_MISE_ENV=1"; fi
@@ -152,15 +147,12 @@ write_npm_globals() {
 JSON
 }
 
-# The commit `git ls-remote` reports for the Gentle Shell main branch, the
-# file gentle-update records it in, and the commands the launcher step runs.
+# A commit left behind by the releases that installed the launcher from git,
+# the file it lives in, and the command the launcher step runs.
 SHELL_SHA="1111111111111111111111111111111111111111"
-SHELL_SHA_OLD="2222222222222222222222222222222222222222"
 SHELL_COMMIT_FILE="$GENTLE_UPDATE_STATE_DIR/gentle-shell.commit"
-SHELL_LS_REMOTE="git ls-remote https://github.com/Gentleman-Programming/gentle-shell refs/heads/main"
 SCRIPT_ALLOWLIST="gentle-pi,@google/genai,protobufjs"
-SHELL_INSTALL="npm install --global --allow-git=all --allow-scripts=$SCRIPT_ALLOWLIST github:Gentleman-Programming/gentle-shell#"
-write_ls_remote() { printf '%s\trefs/heads/main\n' "$1" > "$SANDBOX/ls-remote.out"; }
+SHELL_INSTALL="npm install --global --allow-scripts=$SCRIPT_ALLOWLIST gentle-pi@latest"
 
 DOCTOR_OK='{"features": [{"id": "inbox", "status": "ok", "readyAgents": ["claude", "pi"]}, {"id": "sessions", "status": "ok", "readyAgents": null}]}'
 DOCTOR_REGRESSED='{"features": [{"id": "inbox", "status": "ok", "readyAgents": ["claude", "pi"]}, {"id": "sessions", "status": "error", "readyAgents": null}]}'
@@ -173,14 +165,13 @@ reset() {
     "$SANDBOX/moshi-new-build" "$SANDBOX/doctor-after.json" "$GENTLE_UPDATE_STATE_DIR"/holds/* \
     "$SANDBOX/restore-rc" "$SANDBOX/restore-does-not-fix" "$SANDBOX/fail-npm-ls" \
     "$SANDBOX/fail-mise-env" "$SANDBOX/empty-mise-env" "$SANDBOX/fail-npm-install" \
-    "$SANDBOX/fail-git-ls-remote" "$SHELL_COMMIT_FILE" \
+    "$SHELL_COMMIT_FILE" \
     "$SANDBOX/moshi-restarted" "$SANDBOX/doctor-warming"
   : > "$SANDBOX/moshi-pi-homes.log"
   mkdir -p "$HOME/.gentle-ai"
   printf '%s\n' '{"installed_agents": ["pi", "claude-code", "opencode", "codex"]}' > "$HOME/.gentle-ai/state.json"
   install -m 755 "$SANDBOX/stub" "$STUBS/opencode"
   write_npm_globals
-  write_ls_remote "$SHELL_SHA"
   printf '%s\n' "$DOCTOR_OK" > "$SANDBOX/doctor.json"
   install_bin_dir
   : > "$STUB_LOG"
@@ -269,11 +260,12 @@ fi
 reset
 run_update toolchain
 check_eq "a clean toolchain run exits 0" "0" "$RC"
-check "gentle-ai is built from main" logged "go install github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@main"
+check "gentle-ai is built from its latest release" logged "go install github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@latest"
+check_not "gentle-ai is no longer built from main" grep -q 'gentle-ai@main' "$STUB_LOG"
 check "engram is built from its latest release" logged "go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
 check_eq "the toolchain builds exactly two Go binaries" "2" "$(grep -c '^go install ' "$STUB_LOG")"
 check "installed assets are synced to the new gentle-ai" logged "gentle-ai sync"
-check "the sync runs after the gentle-ai build" test "$(first_line_of '^go install .*gentle-ai@main$')" -lt "$(first_line_of '^gentle-ai sync$')"
+check "the sync runs after the gentle-ai build" test "$(first_line_of '^go install .*gentle-ai@latest$')" -lt "$(first_line_of '^gentle-ai sync$')"
 
 reset
 rm -f "$STUBS/opencode"
@@ -292,72 +284,37 @@ check_not "a held gentle-ai is not synced" grep -q '^gentle-ai sync' "$STUB_LOG"
 reset
 run_update all
 check_eq "a clean launcher run exits 0" "0" "$RC"
-check "the main commit is resolved with git ls-remote" logged "$SHELL_LS_REMOTE"
-check "the launcher is installed from the resolved commit" logged "$SHELL_INSTALL$SHELL_SHA"
-check_eq "the installed commit is recorded" "$SHELL_SHA" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
-check_not "the registry release is no longer installed" grep -q 'gentle-pi@latest' "$STUB_LOG"
+check "the launcher is installed from the registry release" logged "$SHELL_INSTALL"
+check_not "the launcher is no longer installed from git" grep -qE 'allow-git|github:Gentleman-Programming/gentle-shell' "$STUB_LOG"
+check_not "main is no longer resolved" grep -q '^git ls-remote' "$STUB_LOG"
+check_not "a registry install records no commit" test -e "$SHELL_COMMIT_FILE"
 check_not "gentle-pi is never given to npm update" grep -qE '^npm update .* gentle-pi( |$)' "$STUB_LOG"
-check "the step is named after its source" grep -qF 'Gentle Shell launcher (gentle-shell main)' <<<"$OUT"
-RESOLVE_LINE="$(first_line_of '^git ls-remote ')"
-INSTALL_LINE="$(first_line_of '^npm install --global --allow-git=all ')"
-check "the commit is resolved before the install" test -n "$RESOLVE_LINE" -a -n "$INSTALL_LINE" -a "${RESOLVE_LINE:-0}" -lt "${INSTALL_LINE:-0}"
+check "the step is named after its source" grep -qF 'Gentle Shell launcher (latest release)' <<<"$OUT"
 
+# A launcher that was following main moves to the release, and the commit that
+# no longer describes it goes away, so a snapshot cannot restore a stale commit.
 reset
 echo "$SHELL_SHA" > "$SHELL_COMMIT_FILE"
 run_update agents
-check_eq "an unchanged commit exits 0" "0" "$RC"
-check "an unchanged commit is still resolved" logged "$SHELL_LS_REMOTE"
-check_not "an unchanged commit is not reinstalled" grep -q '^npm install --global' "$STUB_LOG"
-check_eq "an unchanged commit stays recorded" "$SHELL_SHA" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
+check_eq "a launcher on a main commit exits 0" "0" "$RC"
+check "a launcher on a main commit is moved to the release" logged "$SHELL_INSTALL"
+check_not "the release install drops the main commit" test -e "$SHELL_COMMIT_FILE"
 
-reset
-echo "$SHELL_SHA_OLD" > "$SHELL_COMMIT_FILE"
-run_update agents
-check "a moved main is installed" logged "$SHELL_INSTALL$SHELL_SHA"
-check_eq "a moved main replaces the recorded commit" "$SHELL_SHA" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
-
-# The record alone is not enough: the command it describes must exist.
 reset
 echo "$SHELL_SHA" > "$SHELL_COMMIT_FILE"
-mv "$STUBS/gentle-shell" "$SANDBOX/hidden-gentle-shell"
-run_update agents
-mv "$SANDBOX/hidden-gentle-shell" "$STUBS/gentle-shell"
-check "a missing gentle-shell command is reinstalled despite the record" logged "$SHELL_INSTALL$SHELL_SHA"
-
-for unresolved in exit-status empty-output malformed-output; do
-  reset
-  echo "$SHELL_SHA_OLD" > "$SHELL_COMMIT_FILE"
-  case "$unresolved" in
-    exit-status)      touch "$SANDBOX/fail-git-ls-remote" ;;
-    empty-output)     : > "$SANDBOX/ls-remote.out" ;;
-    malformed-output) write_ls_remote "not-a-commit" ;;
-  esac
-  run_update agents
-  check_eq "unresolved main ($unresolved) fails the run" "1" "$RC"
-  check "unresolved main ($unresolved) is listed under Errors" grep -q 'Gentle Shell launcher' <<<"$(sed -n '/Errors/,$p' <<<"$OUT")"
-  check_not "unresolved main ($unresolved) installs nothing" grep -q '^npm install --global' "$STUB_LOG"
-  check_eq "unresolved main ($unresolved) keeps the recorded commit" "$SHELL_SHA_OLD" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
-  check "unresolved main ($unresolved) still updates other tools" logged "claude update"
-done
-
-reset
-touch "$SANDBOX/fail-git-ls-remote"
-run_update agents
-check_not "unresolved main records nothing on a first run" test -e "$SHELL_COMMIT_FILE"
-
-reset
 touch "$SANDBOX/fail-npm-install"
 run_update agents
 check_eq "a failing launcher install fails the run" "1" "$RC"
-check "a failing launcher install was attempted" logged "$SHELL_INSTALL$SHELL_SHA"
-check_not "a failing launcher install records no commit" test -e "$SHELL_COMMIT_FILE"
+check "a failing launcher install was attempted" logged "$SHELL_INSTALL"
+check_eq "a failing launcher install keeps the commit it did not replace" "$SHELL_SHA" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
+check "a failing launcher install still updates other tools" logged "claude update"
 
 reset
+echo "$SHELL_SHA" > "$SHELL_COMMIT_FILE"
 touch "$GENTLE_UPDATE_STATE_DIR/holds/gentle-shell"
 run_update all
-check_not "a held gentle-shell does not resolve main" grep -q '^git ls-remote' "$STUB_LOG"
 check_not "a held gentle-shell is not reinstalled" grep -q '^npm install --global' "$STUB_LOG"
-check_not "a held gentle-shell records no commit" test -e "$SHELL_COMMIT_FILE"
+check_eq "a held gentle-shell keeps its commit" "$SHELL_SHA" "$(cat "$SHELL_COMMIT_FILE" 2>/dev/null)"
 
 # --- Gentle Shell MCP servers ---------------------------------------------------
 
@@ -596,7 +553,7 @@ run_update agents
 check_eq "a failed step still exits 1" "1" "$RC"
 check "a failed step reports its exit status" grep -q 'update failed (exit 1)' <<<"$OUT"
 check "a failed run prints the log path" grep -qF "run log: $(latest_log)" <<<"$OUT"
-check "the log records the failed step" grep -qE "step 'Gentle Shell launcher \(gentle-shell main\)' finished: exit 1" "$(latest_log)"
+check "the log records the failed step" grep -qE "step 'Gentle Shell launcher \(latest release\)' finished: exit 1" "$(latest_log)"
 check "the log records the failed run" grep -qE 'finished: exit 1 after [0-9]+s' "$(latest_log)"
 
 reset
