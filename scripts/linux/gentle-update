@@ -463,6 +463,37 @@ update_herdr() {
   step herdr "herdr" herdr herdr update
 }
 
+# The Herdr side of Gentle Shell: a Herdr plugin plus the Pi extension that
+# feeds it. Both are installed when missing and updated otherwise; the sidebar
+# configuration is re-applied afterwards because `configure` is idempotent
+# ("append or repair") and a plugin update can replace what it manages.
+HERDR_GS_PLUGIN="herdr-gentle-shell"
+HERDR_GS_PLUGIN_SOURCE="jonasotoaguilar/herdr-gentle-shell/herdr-plugin"
+HERDR_GS_EXTENSION="npm:herdr-gentle-shell"
+
+sync_herdr_plugin() {
+  if herdr plugin list 2>/dev/null | grep -q "$HERDR_GS_PLUGIN"; then
+    herdr plugin update --yes "$HERDR_GS_PLUGIN" || return 1
+  else
+    herdr plugin install --yes "$HERDR_GS_PLUGIN_SOURCE" || return 1
+  fi
+  herdr plugin action invoke configure --plugin "$HERDR_GS_PLUGIN"
+}
+
+sync_herdr_extension() {
+  if gentle-shell --isolated list 2>/dev/null | grep -qF "$HERDR_GS_EXTENSION"; then
+    # Already declared: `update --extensions` above refreshed it.
+    return 0
+  fi
+  run_pi_scoped gentle-shell --isolated install "$HERDR_GS_EXTENSION"
+}
+
+update_herdr_gentle_shell() {
+  command -v herdr >/dev/null 2>&1 || return 0
+  step herdr-plugin "Herdr plugin $HERDR_GS_PLUGIN" herdr sync_herdr_plugin
+  step gentle-shell "Gentle Shell extension $HERDR_GS_EXTENSION" gentle-shell sync_herdr_extension
+}
+
 # --- plugins -----------------------------------------------------------------
 
 update_claude_plugins() {
@@ -952,6 +983,7 @@ if wants agents; then
   step gentle-shell "Gentle Shell extensions"    gentle-shell run_pi_scoped gentle-shell --isolated update --extensions
   step gentle-shell "Gentle Shell model catalog" gentle-shell gentle-shell --isolated update --models
   update_herdr
+  update_herdr_gentle_shell
 fi
 
 if wants toolchain; then
