@@ -112,6 +112,8 @@ case "$name $*" in
     ;;
   "moshi-hook service restart") touch "$SANDBOX/moshi-restarted" ;;
   # Pi hooks go into whichever home the caller selected; record which one.
+  "herdr integration status")
+    printf '%s\n' "claude: outdated (v9 < v11) (/x)" "codex: installed (v10) (/y)" "pi: not installed (/z)" ;;
   "moshi-hook install --target pi") printf '%s\n' "$PI_CODING_AGENT_DIR" >> "$SANDBOX/moshi-pi-homes.log" ;;
   "moshi-hook update")
     # A real update replaces the binary; do the same when the test asks for it.
@@ -211,6 +213,8 @@ check "the Pi model catalog is refreshed" logged "pi update --models"
 check "the Gentle Shell model catalog is refreshed" logged "gentle-shell --isolated update --models"
 check "moshi-hook is updated" logged "moshi-hook update"
 check "the Herdr Gentle Shell plugin is installed when missing" logged "herdr plugin install --yes jonasotoaguilar/herdr-gentle-shell/herdr-plugin"
+check "an outdated Herdr integration is refreshed" logged "herdr integration install claude"
+check_not "an up-to-date or missing Herdr integration is left alone" grep -qE "herdr integration install (codex|pi)" "$STUB_LOG"
 check "every Herdr plugin is updated, not only ours" logged "herdr plugin update --yes"
 check "Codex plugin marketplaces are refreshed" logged "codex plugin marketplace upgrade"
 check "the Herdr sidebar is configured after the plugin step" logged "herdr plugin action invoke configure --plugin herdr-gentle-shell"

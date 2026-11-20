@@ -490,8 +490,23 @@ sync_herdr_extension() {
   run_pi_scoped gentle-shell --isolated install "$HERDR_GS_EXTENSION"
 }
 
+# Herdr's per-agent integrations (the hook or extension it drops into each
+# agent) are versioned and `herdr update` does not refresh them. Only the ones
+# it reports as outdated are reinstalled: an update must never wire Herdr into
+# an agent the user did not set up.
+sync_herdr_integrations() {
+  local agent status=0
+  while read -r agent; do
+    [ -n "$agent" ] || continue
+    printf '  refreshing the herdr %s integration\n' "$agent"
+    herdr integration install "$agent" || status=1
+  done < <(herdr integration status 2>/dev/null | awk -F: '/: outdated/ { print $1 }')
+  return "$status"
+}
+
 update_herdr_gentle_shell() {
   command -v herdr >/dev/null 2>&1 || return 0
+  step herdr-integrations "Herdr agent integrations" herdr sync_herdr_integrations
   step herdr-plugin "Herdr plugins ($HERDR_GS_PLUGIN + sidebar)" herdr sync_herdr_plugin
   step gentle-shell "Gentle Shell extension $HERDR_GS_EXTENSION" gentle-shell sync_herdr_extension
 }
