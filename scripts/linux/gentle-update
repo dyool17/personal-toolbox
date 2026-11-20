@@ -472,14 +472,15 @@ HERDR_GS_PLUGIN_SOURCE="jonasotoaguilar/herdr-gentle-shell/herdr-plugin"
 HERDR_GS_EXTENSION="npm:herdr-gentle-shell"
 
 sync_herdr_plugin() {
-  if herdr plugin list 2>/dev/null | grep -q "$HERDR_GS_PLUGIN"; then
-    # No name: every GitHub-installed Herdr plugin is refreshed, not only ours.
-    herdr plugin update --yes || return 1
-  else
+  local status=0
+  if ! herdr plugin list 2>/dev/null | grep -q "$HERDR_GS_PLUGIN"; then
     herdr plugin install --yes "$HERDR_GS_PLUGIN_SOURCE" || return 1
-    herdr plugin update --yes || return 1
   fi
-  herdr plugin action invoke configure --plugin "$HERDR_GS_PLUGIN"
+  # No name: every GitHub-installed Herdr plugin is refreshed, not only ours.
+  # A failing plugin is reported but must not stop the sidebar configuration.
+  herdr plugin update --yes || status=1
+  herdr plugin action invoke configure --plugin "$HERDR_GS_PLUGIN" || status=1
+  return "$status"
 }
 
 sync_herdr_extension() {
@@ -509,6 +510,16 @@ update_herdr_gentle_shell() {
   step herdr-integrations "Herdr agent integrations" herdr sync_herdr_integrations
   step herdr-plugin "Herdr plugins ($HERDR_GS_PLUGIN + sidebar)" herdr sync_herdr_plugin
   step gentle-shell "Gentle Shell extension $HERDR_GS_EXTENSION" gentle-shell sync_herdr_extension
+}
+
+# Codex only has marketplace upgrades in recent builds; an older one is skipped
+# rather than reported as a breakage.
+update_codex_plugins() {
+  if ! codex plugin marketplace upgrade --help >/dev/null 2>&1; then
+    printf '  this Codex has no plugin marketplace upgrade; skipped\n'
+    return 0
+  fi
+  codex plugin marketplace upgrade
 }
 
 # --- plugins -----------------------------------------------------------------
@@ -995,7 +1006,7 @@ if wants agents; then
   heading "AI agents (latest stable)"
   step claude   "Claude Code" claude   claude update
   step codex    "Codex"       codex    codex update
-  step codex-plugins "Codex plugin marketplaces" codex codex plugin marketplace upgrade
+  step codex-plugins "Codex plugin marketplaces" codex update_codex_plugins
   step gentle-shell "Gentle Shell extensions"    gentle-shell run_pi_scoped gentle-shell --isolated update --extensions
   step gentle-shell "Gentle Shell model catalog" gentle-shell gentle-shell --isolated update --models
   update_herdr

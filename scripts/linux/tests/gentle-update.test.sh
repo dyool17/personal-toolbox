@@ -112,6 +112,10 @@ case "$name $*" in
     ;;
   "moshi-hook service restart") touch "$SANDBOX/moshi-restarted" ;;
   # Pi hooks go into whichever home the caller selected; record which one.
+  "herdr plugin list")
+    [ -e "$SANDBOX/herdr-has-plugin" ] && echo "- herdr-gentle-shell (Herdr Gentle Shell) enabled" ;;
+  "herdr plugin update --yes")  [ -e "$SANDBOX/fail-herdr-update" ] && exit 1 ;;
+  "codex plugin marketplace upgrade --help") [ -e "$SANDBOX/old-codex" ] && exit 2 ;;
   "herdr integration status")
     printf '%s\n' "claude: outdated (v9 < v11) (/x)" "codex: installed (v10) (/y)" "pi: not installed (/z)" ;;
   "moshi-hook install --target pi") printf '%s\n' "$PI_CODING_AGENT_DIR" >> "$SANDBOX/moshi-pi-homes.log" ;;
@@ -168,7 +172,8 @@ reset() {
     "$SANDBOX/restore-rc" "$SANDBOX/restore-does-not-fix" "$SANDBOX/fail-npm-ls" \
     "$SANDBOX/fail-mise-env" "$SANDBOX/empty-mise-env" "$SANDBOX/fail-npm-install" \
     "$SHELL_COMMIT_FILE" \
-    "$SANDBOX/moshi-restarted" "$SANDBOX/doctor-warming"
+    "$SANDBOX/moshi-restarted" "$SANDBOX/doctor-warming" \
+    "$SANDBOX/herdr-has-plugin" "$SANDBOX/fail-herdr-update" "$SANDBOX/old-codex"
   : > "$SANDBOX/moshi-pi-homes.log"
   mkdir -p "$HOME/.gentle-ai"
   printf '%s\n' '{"installed_agents": ["pi", "claude-code", "opencode", "codex"]}' > "$HOME/.gentle-ai/state.json"
@@ -594,6 +599,29 @@ reset
 OUT="$(GENTLE_UPDATE_TRACE=1 "$APP/gentle-update" plugins 2>&1 </dev/null)"
 check "GENTLE_UPDATE_TRACE=1 writes a trace next to the log" test -s "$(latest_log | sed 's/\.log$/.trace/')"
 check_not "the trace stays out of the terminal output" grep -q '^+ ' <<<"$OUT"
+
+# --- Herdr plugin and Codex marketplace paths ---------------------------------
+
+reset
+touch "$SANDBOX/herdr-has-plugin"
+run_update agents
+check_eq "an installed plugin run exits 0" "0" "$RC"
+check_not "an installed plugin is not installed again" grep -q '^herdr plugin install' "$STUB_LOG"
+check "an installed plugin still gets every plugin updated" logged "herdr plugin update --yes"
+check "an installed plugin still gets the sidebar configured" logged "herdr plugin action invoke configure --plugin herdr-gentle-shell"
+
+reset
+touch "$SANDBOX/herdr-has-plugin" "$SANDBOX/fail-herdr-update"
+run_update agents
+check_eq "a failing plugin update exits 1" "1" "$RC"
+check "a failing plugin update is reported" grep -q 'Herdr plugins' <<<"$(sed -n '/Errors/,$p' <<<"$OUT")"
+check "a failing plugin update still configures the sidebar" logged "herdr plugin action invoke configure --plugin herdr-gentle-shell"
+
+reset
+touch "$SANDBOX/old-codex"
+run_update agents
+check_eq "a Codex without marketplace upgrade exits 0" "0" "$RC"
+check_not "a Codex without marketplace upgrade is not asked to upgrade" logged "codex plugin marketplace upgrade"
 
 printf '\n'
 if [ "$FAILS" -gt 0 ]; then
