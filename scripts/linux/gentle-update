@@ -4,7 +4,7 @@
 # Groups, because they track deliberately different things:
 #
 #   agents     AI coding agents and their runtimes -> latest stable.
-#              Claude Code, Codex, OpenCode, Pi runtime, Gentle Shell, herdr.
+#              Claude Code, Codex, Pi runtime, Gentle Shell, herdr.
 #   toolchain  Gentleman tools -> latest official release (never main).
 #              gentle-ai and engram are built from their latest release. The
 #              standalone Gentle Shell home is provisioned by its launcher
@@ -86,7 +86,7 @@ PI_HOMES=("${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}" "${GENTLE_SHELL_HOME:-$HOME/
 MOSHI_AGENTS=(claude codex pi)
 # Tools that must still answer `--version` after the run. Each name is also
 # the gentle-rollback component that restores it.
-SMOKE_TOOLS=(claude codex opencode pi gentle-shell herdr gentle-ai engram moshi-hook mise)
+SMOKE_TOOLS=(claude codex pi gentle-shell herdr gentle-ai engram moshi-hook mise)
 
 TARGET="${1:-all}"
 FAILED=()
@@ -260,7 +260,7 @@ version_of() {
   "$1" --version 2>/dev/null | head -1 | tr -d '\r' || echo "unknown"
 }
 
-REPORTED_TOOLS=(claude codex opencode pi gentle-shell herdr gentle-ai engram mise qmd)
+REPORTED_TOOLS=(claude codex pi gentle-shell herdr gentle-ai engram mise qmd)
 declare -A VERSION_BEFORE=()
 
 # The first call records each version; later calls mark what changed since.
@@ -473,9 +473,11 @@ HERDR_GS_EXTENSION="npm:herdr-gentle-shell"
 
 sync_herdr_plugin() {
   if herdr plugin list 2>/dev/null | grep -q "$HERDR_GS_PLUGIN"; then
-    herdr plugin update --yes "$HERDR_GS_PLUGIN" || return 1
+    # No name: every GitHub-installed Herdr plugin is refreshed, not only ours.
+    herdr plugin update --yes || return 1
   else
     herdr plugin install --yes "$HERDR_GS_PLUGIN_SOURCE" || return 1
+    herdr plugin update --yes || return 1
   fi
   herdr plugin action invoke configure --plugin "$HERDR_GS_PLUGIN"
 }
@@ -490,7 +492,7 @@ sync_herdr_extension() {
 
 update_herdr_gentle_shell() {
   command -v herdr >/dev/null 2>&1 || return 0
-  step herdr-plugin "Herdr plugin $HERDR_GS_PLUGIN" herdr sync_herdr_plugin
+  step herdr-plugin "Herdr plugins ($HERDR_GS_PLUGIN + sidebar)" herdr sync_herdr_plugin
   step gentle-shell "Gentle Shell extension $HERDR_GS_EXTENSION" gentle-shell sync_herdr_extension
 }
 
@@ -826,7 +828,7 @@ smoke_check() {
     elif [ "$status" -eq 0 ] && answers_version "$tool"; then
       FAILED+=("$tool broke after the update; rolled back and held")
     else
-      # Includes mise, claude and opencode, whose restore runs the broken tool.
+      # Includes mise and claude, whose restore runs the broken tool.
       hold_broken "$tool" "broke after an update; rollback to $SNAPSHOT_ID failed"
       FAILED+=("$tool broke after the update; rollback failed")
     fi
@@ -891,7 +893,6 @@ if [ -z "${MISE_SHELL:-}" ]; then
   fi
 fi
 # Locally installed tools win over the copies mise may also provide.
-if [ -d "$HOME/.opencode/bin" ]; then PATH="$HOME/.opencode/bin:$PATH"; fi
 PATH="$BIN_DIR:$PATH"
 export PATH
 
@@ -979,7 +980,7 @@ if wants agents; then
   heading "AI agents (latest stable)"
   step claude   "Claude Code" claude   claude update
   step codex    "Codex"       codex    codex update
-  step opencode "OpenCode"    opencode opencode upgrade
+  step codex-plugins "Codex plugin marketplaces" codex codex plugin marketplace upgrade
   step gentle-shell "Gentle Shell extensions"    gentle-shell run_pi_scoped gentle-shell --isolated update --extensions
   step gentle-shell "Gentle Shell model catalog" gentle-shell gentle-shell --isolated update --models
   update_herdr

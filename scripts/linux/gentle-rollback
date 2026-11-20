@@ -11,7 +11,7 @@
 #
 #   gentle-ai engram herdr    The binary itself, content-addressed in store/.
 #   moshi-hook                The binary, then agent hooks and the daemon.
-#   mise claude opencode      The version; restored with the tool's own
+#   mise claude               The version; restored with the tool's own
 #                             installer pinned to that version.
 #   pi gentle-shell           The npm global version plus a whitelist of files
 #                             from the Pi home (settings, extensions, lockfile).
@@ -72,12 +72,12 @@ GENTLE_SHELL_HOME_DIR="${GENTLE_SHELL_HOME:-$HOME/.gentle-shell/agent}"
 PLUGINS_FILE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json"
 PNPM_GLOBAL_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
 
-COMPONENTS=(gentle-ai engram herdr moshi-hook mise claude opencode pi gentle-shell
+COMPONENTS=(gentle-ai engram herdr moshi-hook mise claude pi gentle-shell
   codex npm-globals pnpm-globals claude-plugins)
 # Standalone binaries in BIN_DIR, saved byte for byte.
 BINARIES=(gentle-ai engram herdr moshi-hook)
 # Tools whose `--version` line is recorded.
-VERSIONED=(gentle-ai engram herdr moshi-hook mise claude opencode pi gentle-shell codex)
+VERSIONED=(gentle-ai engram herdr moshi-hook mise claude pi gentle-shell codex)
 # Files and directories copied from each Pi home. Everything else in a home
 # (auth.json, sessions, caches) is either a credential or not worth restoring.
 HOME_WHITELIST=(settings.json models-store.json extensions agents gentle-ai skills
@@ -321,7 +321,7 @@ comp_diff() {
         "${have:0:12}" "$(tsv_get "$CUR/versions.tsv" "$comp")" \
         "${want:0:12}" "$(tsv_get "$SNAP/versions.tsv" "$comp")"
       ;;
-    mise|claude|opencode)
+    mise|claude)
       want="$(tsv_get "$SNAP/versions.tsv" "$comp")"
       have="$(tsv_get "$CUR/versions.tsv" "$comp")"
       if [ -z "$want" ] || [ "$want" = "-" ]; then return 0; fi
@@ -364,7 +364,7 @@ comp_state() {
         echo "not recorded"
       fi
       ;;
-    mise|claude|opencode)
+    mise|claude)
       tsv_get "$SNAP/versions.tsv" "$comp" ;;
     pi)
       printf '%s, home files\n' "$(tsv_get "$SNAP/versions.tsv" pi)" ;;
@@ -615,7 +615,6 @@ restore_version() {
   case "$comp" in
     mise)     run mise self-update --yes "$version" ;;
     claude)   run claude install "$version" ;;
-    opencode) run opencode upgrade "$version" ;;
   esac
 }
 
@@ -716,7 +715,7 @@ restore_component() {
   case "$1" in
     gentle-ai|engram|herdr)          restore_binary "$1" ;;
     moshi-hook)                      restore_moshi_hook ;;
-    mise|claude|opencode)            restore_version "$1" ;;
+    mise|claude)            restore_version "$1" ;;
     pi|gentle-shell)                 restore_pi_home "$1" ;;
     codex|npm-globals|pnpm-globals)  restore_packages "$1" ;;
     claude-plugins)                  restore_claude_plugins ;;

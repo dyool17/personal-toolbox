@@ -78,14 +78,13 @@ case "$name $*" in
   *" --version")                 cat "$SANDBOX/versions/$name" ;;
 esac
 EOF
-for tool in npm pnpm claude opencode mise pi gentle-shell codex; do
+for tool in npm pnpm claude mise pi gentle-shell codex; do
   install -m 755 "$SANDBOX/stub" "$STUBS/$tool"
 done
 export PATH="$STUBS:/usr/bin:/bin"
 
 echo "2026.10.2 linux-x64 (2026-10-04)" > "$SANDBOX/versions/mise"
 echo "2.1.289 (Claude Code)"            > "$SANDBOX/versions/claude"
-echo "1.18.34"                          > "$SANDBOX/versions/opencode"
 echo "1.0.3"                            > "$SANDBOX/versions/pi"
 echo "gentle-shell 4.0.0"               > "$SANDBOX/versions/gentle-shell"
 echo "codex-cli 0.160.0"                > "$SANDBOX/versions/codex"
@@ -154,7 +153,6 @@ fresh_state() {
 
 check_eq "version-number: claude"     "2.1.289"      "$(rb version-number '2.1.289 (Claude Code)' 2>/dev/null)"
 check_eq "version-number: mise"       "2026.10.2"    "$(rb version-number '2026.10.2 linux-x64 (2026-10-04)' 2>/dev/null)"
-check_eq "version-number: opencode"   "1.18.34"      "$(rb version-number '1.18.34' 2>/dev/null)"
 check_eq "version-number: prefixed"   "0.160.0"      "$(rb version-number 'codex-cli 0.160.0' 2>/dev/null)"
 check_eq "version-number: prerelease" "1.2.3-beta.1" "$(rb version-number 'v1.2.3-beta.1' 2>/dev/null)"
 check_not "version-number: no version exits non-zero" rb version-number 'unknown'
@@ -186,7 +184,7 @@ check_eq "default reason is manual" "manual" "$(cat "$GENTLE_UPDATE_STATE_DIR/sn
 check_eq "identical binaries share one blob" "4" "$(blob_count)"
 
 SHOW="$(rb show latest 2>&1)"
-check_eq "show lists every component" "13" "$(printf '%s\n' "$SHOW" | grep -cE '^  (gentle-ai|engram|herdr|moshi-hook|mise|claude|opencode|pi|gentle-shell|codex|npm-globals|pnpm-globals|claude-plugins) ')"
+check_eq "show lists every component" "12" "$(printf '%s\n' "$SHOW" | grep -cE '^  (gentle-ai|engram|herdr|moshi-hook|mise|claude|pi|gentle-shell|codex|npm-globals|pnpm-globals|claude-plugins) ')"
 check_not "show reports no difference right after a snapshot" grep -q 'differs' <<<"$SHOW"
 check "list shows the snapshot with nothing differing" grep -qE "^$ID1 +first +0 differ" <<<"$(rb list 2>&1)"
 
@@ -275,7 +273,6 @@ fresh_state packages
 IDP="$(rb snapshot 2>/dev/null)"
 echo "2.2.0 (Claude Code)" > "$SANDBOX/versions/claude"
 echo "2026.11.0 linux-x64 (2026-11-01)" > "$SANDBOX/versions/mise"
-echo "1.19.0" > "$SANDBOX/versions/opencode"
 write_npm_globals 2.0.0 0.161.0
 write_pnpm_globals 0.16.0
 : > "$STUB_LOG"
@@ -286,16 +283,15 @@ check_not "--only npm-globals leaves codex alone" grep -q '@openai/codex' "$STUB
 
 # `latest` is now the pre-rollback snapshot of the restore above, which holds
 # the changed versions; name the original snapshot instead.
-rb restore "$IDP" --only codex,pnpm-globals,claude,mise,opencode --yes >/dev/null 2>&1
+rb restore "$IDP" --only codex,pnpm-globals,claude,mise --yes >/dev/null 2>&1
 check "codex is reinstalled at the snapshot version" grep -qx 'npm install --global @openai/codex@0.160.0' "$STUB_LOG"
 check "changed pnpm global is re-added at the snapshot version" grep -qx 'pnpm add --global @scope/tool@0.15.1' "$STUB_LOG"
 check "claude is reinstalled at the snapshot version" grep -qx 'claude install 2.1.289' "$STUB_LOG"
 check "mise is pinned back to the snapshot version" grep -qx 'mise self-update --yes 2026.10.2' "$STUB_LOG"
-check "opencode is moved back to the snapshot version" grep -qx 'opencode upgrade 1.18.34' "$STUB_LOG"
+check_not "opencode is no longer a rollback component" grep -q opencode "$STUB_LOG"
 
 echo "2.1.289 (Claude Code)" > "$SANDBOX/versions/claude"
 echo "2026.10.2 linux-x64 (2026-10-04)" > "$SANDBOX/versions/mise"
-echo "1.18.34" > "$SANDBOX/versions/opencode"
 write_npm_globals 1.0.0 0.160.0
 write_pnpm_globals 0.15.1
 

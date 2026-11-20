@@ -211,6 +211,8 @@ check "the Pi model catalog is refreshed" logged "pi update --models"
 check "the Gentle Shell model catalog is refreshed" logged "gentle-shell --isolated update --models"
 check "moshi-hook is updated" logged "moshi-hook update"
 check "the Herdr Gentle Shell plugin is installed when missing" logged "herdr plugin install --yes jonasotoaguilar/herdr-gentle-shell/herdr-plugin"
+check "every Herdr plugin is updated, not only ours" logged "herdr plugin update --yes"
+check "Codex plugin marketplaces are refreshed" logged "codex plugin marketplace upgrade"
 check "the Herdr sidebar is configured after the plugin step" logged "herdr plugin action invoke configure --plugin herdr-gentle-shell"
 check "the Herdr extension is installed in the Gentle Shell home when missing" logged "gentle-shell --isolated install npm:herdr-gentle-shell"
 check_eq "Pi hooks are installed in both Pi homes" "$PI_CODING_AGENT_DIR,$GENTLE_SHELL_HOME" "$(paste -sd, "$SANDBOX/moshi-pi-homes.log")"
@@ -399,7 +401,8 @@ check_eq "a run with holds exits 0" "0" "$RC"
 check_not "a held component is not updated" logged "claude update"
 check "a held component is listed under Skipped" grep -qF 'Claude Code — held by gentle-rollback (gentle-rollback unhold claude)' <<<"$(sed -n '/Skipped/,$p' <<<"$OUT")"
 check "held npm packages are left out of the npm update" logged "npm update -g --allow-scripts=$SCRIPT_ALLOWLIST @earendil-works/pi-coding-agent left-pad"
-check "other components still update" logged "opencode upgrade"
+check "other components still update" logged "pnpm update -g"
+check_not "OpenCode is never touched" grep -qi opencode <(grep -v "gentle-ai sync" "$STUB_LOG")
 
 reset
 touch "$GENTLE_UPDATE_STATE_DIR/holds/npm-globals" "$GENTLE_UPDATE_STATE_DIR/holds/moshi-hook"
