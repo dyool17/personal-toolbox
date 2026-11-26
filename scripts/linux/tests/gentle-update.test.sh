@@ -71,7 +71,12 @@ fi
 if [ "${1:-}" = restore ]; then
   # restore-rc selects the outcome: 0 restored, 3 nothing differed, 1 failed.
   rc="$(cat "$SANDBOX/restore-rc" 2>/dev/null || echo 0)"
-  if [ "$rc" = 0 ] && [ ! -e "$SANDBOX/restore-does-not-fix" ]; then rm -f "$SANDBOX/claude-broken"; fi
+  if [ "$rc" = 0 ] && [ ! -e "$SANDBOX/restore-does-not-fix" ]; then
+    case "$4" in
+      claude) rm -f "$SANDBOX/claude-broken" ;;
+      gentle-shell) rm -f "$SANDBOX/shell-broken" ;;
+    esac
+  fi
   exit "$rc"
 fi
 exit 0
@@ -119,6 +124,7 @@ case "$name $*" in
     if [ -e "$SANDBOX/native-rollback-during-extensions" ]; then
       ln -sfn versions/5.0.0-1.6.0 "$HOME/.gentle-shell/current"
     fi ;;
+  "gentle-shell --isolated update --models") [ ! -e "$SANDBOX/fail-shell-catalog" ] || exit 75 ;;
   "go install "*"/v5/cmd/gentle-ai@v5.0.0")
     [ ! -e "$SANDBOX/fail-ai-build" ] || exit 1
     install -m 755 "$SANDBOX/stub" "$GOBIN/gentle-ai"
@@ -137,7 +143,9 @@ case "$name $*" in
     if [ ! -e "$SANDBOX/empty-mise-env" ]; then echo "export GENTLE_TEST_MISE_ENV=1"; fi
     ;;
   "claude plugin list")         echo "demo@market" ;;
-  "claude update")              if [ -e "$SANDBOX/break-claude" ]; then touch "$SANDBOX/claude-broken"; fi ;;
+  "claude update")
+    if [ -e "$SANDBOX/break-claude" ]; then touch "$SANDBOX/claude-broken"; fi
+    if [ -e "$SANDBOX/break-shell-after-snapshot" ]; then touch "$SANDBOX/shell-broken"; fi ;;
   "claude --version")           [ -e "$SANDBOX/claude-broken" ] && exit 1; echo "2.1.289 (Claude Code)" ;;
   "go env GOPATH")              echo "$SANDBOX/gopath" ;;
   "moshi-hook doctor --json")
@@ -367,6 +375,7 @@ done
 reset
 run_split packages
 check_eq 'packages before agents: exits 0' 0 "$RC"
+check 'packages preserves the exact snapshot confirmation' grep -qxF $'\033[32m✓\033[0m snapshot 20260101-000000 (undo with: gentle-rollback restore 20260101-000000)' <<<"$OUT"
 check_eq 'packages leaves the active Shell unchanged' 'versions/4.1.0-1.6.0' "$(readlink "$SHELL_PREFIX/current")"
 check_eq 'packages before agents: stderr is empty' '' "$ERR"
 check_not 'packages stdout has no launcher step' grep -qF 'Gentle Shell standalone launcher' <<<"$OUT"
@@ -504,6 +513,51 @@ for phase in pi setup extensions; do
       check_eq "rollback during $phase: no further isolated commands" "$expected" "$(grep '^gentle-shell --isolated' "$STUB_LOG")" ;;
   esac
 done
+
+reset
+ln -s "$HOME" "$SANDBOX/linked-home"
+HOME="$SANDBOX/linked-home" run_split agents
+check_eq 'symlinked HOME exits 0' 0 "$RC"
+check 'symlinked HOME stdout reports the upgrade' grep -qxF '  gentle-shell gentle-shell 4.1.0 -> gentle-shell 5.0.0  (upgraded)' <<<"$OUT"
+check_not 'symlinked HOME stderr does not reject launcher ownership' grep -qF 'not a verified bundled PATH launcher' <<<"$ERR"
+check 'symlinked HOME upgrades natively' logged "$SHELL_UPGRADE"
+check_not 'symlinked HOME never uses legacy install or restore' grep -qE '^npm install --global|^gentle-rollback restore' "$STUB_LOG"
+
+for kind in legacy bundled; do
+  reset
+  fixture_shell 5.0.0
+  if [ "$kind" = legacy ]; then
+    rm -f "$STUBS/gentle-shell"
+    install -m 755 "$SANDBOX/stub" "$STUBS/gentle-shell"
+  fi
+  touch "$SANDBOX/break-shell-after-snapshot"
+  run_split agents
+  rm -f "$SANDBOX/break-shell-after-snapshot"
+  check_eq "$kind smoke failure exits 1" 1 "$RC"
+  check "$kind smoke failure is reported on stderr" grep -qxF $'\033[33m!\033[0m gentle-shell no longer runs after the update' <<<"$ERR"
+  if [ "$kind" = legacy ]; then
+    check 'legacy smoke failure uses the snapshot' logged 'gentle-rollback restore 20260101-000000 --only gentle-shell --yes'
+    check 'legacy recovery is reported on stdout' grep -qxF '  • gentle-shell broke after the update; rolled back and held' <<<"$OUT"
+  else
+    check_not 'bundled smoke failure never uses legacy restore' grep -q '^gentle-rollback restore' "$STUB_LOG"
+    check 'bundled recovery points to native rollback on stdout' grep -qxF "  • gentle-shell broke after the update; use native 'gentle-shell upgrade --rollback' if available; otherwise $SHELL_MANUAL" <<<"$OUT"
+  fi
+done
+
+reset
+touch "$SANDBOX/fail-shell-catalog"
+run_split agents
+rm -f "$SANDBOX/fail-shell-catalog"
+check_eq 'catalog failure exits 1' 1 "$RC"
+check 'catalog failure appears on stdout' grep -qxF '  • Gentle Shell model catalog' <<<"$OUT"
+check 'catalog failure appears on stderr' grep -qxF $'\033[33m!\033[0m Gentle Shell model catalog — update failed (exit 75)' <<<"$ERR"
+check 'catalog failure preserves exact pending version' cmp -s "$pending" <(printf '5.0.0\n')
+: > "$STUB_LOG"
+run_split agents
+check_eq 'catalog retry exits 0' 0 "$RC"
+check 'catalog retry reports success' grep -qxF $'\033[32m✓\033[0m Gentle Shell model catalog' <<<"$OUT"
+check_not 'catalog retry does not reinstall the launcher' logged "$SHELL_UPGRADE"
+check_not 'catalog retry success clears pending work' test -e "$pending"
 
 if [ "${1:-}" = --v5-only ]; then
   printf '\n%d v5 assertion(s) failed\n' "$FAILS"

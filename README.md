@@ -34,11 +34,11 @@ The `agents`, `toolchain`, and `all` routes use
 `gentle-shell upgrade --channel release` only for a verified bundled PATH launcher
 (4.1.0 or newer in major 4 or 5) and only when the official npm `latest` release
 is stable v5. Native upgrade resolves `latest` again; this check is not a version
-pin. The same run performs isolated-home setup, extension refresh, and
-finalization only if the active Shell matches the exact version seen before
-upgrade. A mismatch is reported as a failure without automatic rollback. If
-setup or extension refresh fails, the next Shell update run retries both while
-that verified version is still active. The updater rechecks the active version
+pin. The same run performs isolated-home setup, extension and model-catalog
+refresh, and finalization only if the active Shell matches the exact version
+seen before upgrade. A mismatch is reported as a failure without automatic
+rollback. If setup or either refresh fails, the next Shell update run retries
+them while that verified version is still active. The updater rechecks the active version
 before changing the isolated home and before clearing the pending work. If it
 observes a mismatch, it stops Shell-home work and keeps the pending marker.
 A completed, already-current Shell skips that work.
