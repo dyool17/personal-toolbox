@@ -65,6 +65,31 @@ its own Gentle AI runtime.
 
 [shell-releases]: https://github.com/Gentleman-Programming/gentle-shell/releases
 
+### Engram on Linux
+
+`toolchain` and `all` install the latest Engram v3 release unless Engram is held.
+Before replacing an installed Engram with an existing database (`~/.engram` or
+`ENGRAM_DATA_DIR`), the updater uses the old binary to run
+`engram export <file>.json --all`. The three newest timestamped updater exports
+are kept in `engram-backups/` under the updater state directory (by default
+`~/.local/state/gentle-update`). The directory is mode `0700` and each export
+is mode `0600`. These files contain sensitive memory, not configuration. No
+raw SQLite files are copied, and the regular rollback snapshot does not restore
+Engram memory.
+
+If the export fails, the updater reports the failure and leaves the binary
+unchanged. In a private directory, try
+`umask 077; engram export ./engram-manual-backup.json --all` with a new filename.
+Resolve the backup failure before retrying `gentle-update toolchain`. Fresh
+installs and installs without a database do not need an export.
+
+After installing, the updater uses `engram ps` to check the managed daemon;
+`engram --version` describes only the executable. If the running version is old,
+run `engram restart` once your sessions are idle. If the Pi companion needs an
+update, run `engram setup pi` and then restart Pi. The updater never runs those
+commands itself. It warns if it cannot confirm the running version and does not
+warn when `engram ps` reports that there is no running daemon.
+
 ### Run logs
 
 `gentle-update` and `gentle-reset` write one log per run, and print its path

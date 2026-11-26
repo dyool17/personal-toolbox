@@ -40,6 +40,12 @@
 #     snapshot nothing is updated, unless GENTLE_UPDATE_NO_SNAPSHOT=1.
 #   - A component held by gentle-rollback is skipped, so a release that was
 #     rolled back is not reinstalled the next day.
+#   - Before replacing an installed Engram with existing data, export memory
+#     with `engram export <file>.json --all`. Keep the newest 3 private exports
+#     under the updater state directory's engram-backups/ (not config backups).
+#     If the export fails, the binary is not replaced. The updater never restarts Engram.
+#     When `engram ps` shows a version mismatch, run `engram restart` once sessions
+#     are idle. If needed, run `engram setup pi` and restart Pi manually.
 #   - After the updates every tool that answered `--version` before must still
 #     answer. Failures use snapshot rollback where supported. For bundled Shell
 #     recovery, use its own `gentle-shell upgrade --rollback` if available, or
@@ -312,6 +318,77 @@ install_go_binary() {
       rm -f "$dir/$name"
     fi
   done
+}
+
+# Export through the old CLI, never by copying a live SQLite database. Publish
+# only a complete export; the leading dot keeps unfinished files out of retention.
+backup_engram() (
+  local dir="$1" stamp pending backup
+  umask 077
+  [ ! -L "$dir" ] && mkdir -p -- "$dir" && [ -O "$dir" ] && chmod 700 -- "$dir" || return 1
+  stamp="$(date -u '+%Y%m%dT%H%M%S.%NZ')" || return 1
+  pending="$(mktemp --suffix=.json -- "$dir/.pending-XXXXXXXX")" || return 1
+  trap 'rm -f -- "$pending"' EXIT
+  engram export "$pending" --all >/dev/null 2>&1 && [ -s "$pending" ] && chmod 600 -- "$pending" || return 1
+  backup="$dir/engram-$stamp-${pending##*-}"
+  ln -T -- "$pending" "$backup" || return 1
+  printf '%s\n' "$backup"
+)
+
+prune_engram_backups() {
+  local dir="$1" old
+  # The private namespace excludes manual exports, symlinks, and subdirectories.
+  find "$dir" -maxdepth 1 -regextype posix-extended -type f \
+    -regex '.*/engram-[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[[:alnum:]]{8}\.json' -printf '%f\n' \
+    | LC_ALL=C sort -r | tail -n +4 \
+    | while IFS= read -r old; do rm -- "$dir/$old" || exit 1; done
+}
+
+# ps describes the managed daemon; --version only describes the executable.
+check_engram_server() {
+  local backup="$1" location='' output status=0 line installed='' server='' pending=0 stopped=0
+  local version_re="v?($STABLE_VERSION([+-][a-z0-9.+-]+)?)"
+  local installed_re="^[[:space:]]*installed version:[[:space:]]*${version_re}[[:space:]]*$"
+  local server_re="^[[:space:]]*server version:[[:space:]]*${version_re}[[:space:]]*$"
+  local stopped_re='^[[:space:]]*((engram( server)? is )?not running\.?|status:[[:space:]]*(not running|stopped))[[:space:]]*$'
+  local pending_re='^[[:space:]]*(restart pending([[:space:]:.!]|$)|status:[[:space:]]*running[[:space:]]*\(restart pending\))'
+  local no_pending_re='^[[:space:]]*restart pending:[[:space:]]*(no|false)[[:space:]]*$'
+  [ -z "$backup" ] || location=" Backup: $backup"
+  output="$(timeout 10s engram ps 2>/dev/null)" || status=$?
+  while IFS= read -r line; do
+    line="${line,,}"
+    if [[ "$line" =~ $installed_re ]]; then
+      installed="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ $server_re ]]; then
+      server="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ $stopped_re ]]; then
+      stopped=1
+    elif [[ "$line" =~ $pending_re && ! "$line" =~ $no_pending_re ]]; then
+      pending=1
+    fi
+  done <<< "$output"
+
+  [ "$stopped" = 0 ] || return 0
+  if [ "$status" = 0 ] && [[ "$pending" = 1 || ( -n "$installed" && -n "$server" && "$installed" != "$server" ) ]]; then
+    warn "engram — the running server still uses the old version; run \`engram restart\` when sessions are idle. If the Pi companion needs updating, run \`engram setup pi\` and restart Pi.$location"
+  elif [ "$status" != 0 ] || [ -z "$installed" ] || [ -z "$server" ]; then
+    warn "engram — the running server version could not be confirmed with \`engram ps\`.$location"
+  fi
+}
+
+update_engram() {
+  local data="${ENGRAM_DATA_DIR:-$HOME/.engram}" dir="$STATE/engram-backups" backup=''
+  if command -v engram >/dev/null 2>&1 && [ -e "$data/engram.db" ]; then
+    if ! backup="$(backup_engram "$dir")"; then
+      warn "engram — memory backup failed; binary left unchanged. In a private directory, run \`umask 077; engram export ./engram-manual-backup.json --all\` (choose a new filename), then retry \`gentle-update toolchain\`."
+      return 1
+    fi
+    ok "engram memory backup: $backup"
+    prune_engram_backups "$dir" || warn "engram — could not prune older memory backups under $dir"
+  fi
+  install_go_binary engram "$ENGRAM_PKG" || return $?
+  hash -r
+  check_engram_server "$backup"
 }
 
 # Preserve the installed agent filter; do not invoke an unqualified sync when
@@ -1242,7 +1319,7 @@ fi
 if wants toolchain; then
   heading "Gentleman toolchain (latest release)"
   update_gentle_ai
-  step engram "engram" go install_go_binary engram "$ENGRAM_PKG"
+  step engram "engram" go update_engram
   if [ "$AI_READY" = 1 ]; then
     step gentle-ai "gentle-ai sync" gentle-ai sync_gentle_ai_assets "$BIN_DIR/gentle-ai"
   fi

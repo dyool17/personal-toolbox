@@ -45,7 +45,7 @@ export GENTLE_SHELL_HOME="$HOME/.gentle-shell/agent"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 export PNPM_HOME="$SANDBOX/pnpm"
 # The run must not depend on the shell the tests were started from.
-unset GENTLE_UPDATE_LOCK_HELD GENTLE_UPDATE_NO_SNAPSHOT GENTLE_UPDATE_LOG_DIR GENTLE_UPDATE_NO_LOG GENTLE_UPDATE_TRACE XDG_STATE_HOME MISE_SHELL HERDR_ENV GENTLE_PI_CONFIG_HOME GENTLE_AI_HOME GENTLE_AI_PI_CONFIG_DIR
+unset GENTLE_UPDATE_LOCK_HELD GENTLE_UPDATE_NO_SNAPSHOT GENTLE_UPDATE_LOG_DIR GENTLE_UPDATE_NO_LOG GENTLE_UPDATE_TRACE XDG_STATE_HOME MISE_SHELL HERDR_ENV GENTLE_PI_CONFIG_HOME GENTLE_AI_HOME GENTLE_AI_PI_CONFIG_DIR ENGRAM_DATA_DIR
 
 APP="$SANDBOX/app"
 STUBS="$SANDBOX/stubs"
@@ -129,6 +129,30 @@ case "$name $*" in
     [ ! -e "$SANDBOX/fail-ai-build" ] || exit 1
     install -m 755 "$SANDBOX/stub" "$GOBIN/gentle-ai"
     if [ ! -e "$SANDBOX/invalid-ai-build" ]; then echo '# v5 build' >> "$GOBIN/gentle-ai"; fi
+    ;;
+  "go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest")
+    install -m 755 "$SANDBOX/stub" "$GOBIN/engram"
+    printf '# new Engram build\n' >> "$GOBIN/engram"
+    ;;
+  "engram --version")
+    if grep -qxF '# new Engram build' "$0"; then echo 'engram v3.7.2'; else echo 'engram v3.7.1'; fi
+    ;;
+  "engram export "*".json --all")
+    grep -qxF '# new Engram build' "$0" && exit 71
+    printf '%s\n' '{"version":1,"observations":[]}' > "$2"
+    [ ! -e "$SANDBOX/fail-engram-export" ] || exit 72
+    ;;
+  "engram ps")
+    grep -qxF '# new Engram build' "$0" || exit 73
+    if [ -e "$SANDBOX/engram-ps-unavailable" ]; then
+      echo 'unknown command "ps"' >&2
+      exit 1
+    fi
+    if [ -e "$SANDBOX/engram-ps" ]; then
+      cat "$SANDBOX/engram-ps"
+    else
+      echo 'Engram server is not running.'
+    fi
     ;;
   "go version -m "*)
     major=4
@@ -584,6 +608,125 @@ check_eq 'catalog retry exits 0' 0 "$RC"
 check 'catalog retry reports success' grep -qxF $'\033[32m✓\033[0m Gentle Shell model catalog' <<<"$OUT"
 check_not 'catalog retry does not reinstall the launcher' logged "$SHELL_UPGRADE"
 check_not 'catalog retry success clears pending work' test -e "$pending"
+
+# --- Engram backup and running version ---------------------------------------
+
+ENGRAM_INSTALL='go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest'
+ENGRAM_RESTART="engram — the running server still uses the old version; run \`engram restart\` when sessions are idle. If the Pi companion needs updating, run \`engram setup pi\` and restart Pi."
+ENGRAM_UNKNOWN="engram — the running server version could not be confirmed with \`engram ps\`."
+ENGRAM_EXPORT_FAILED="engram — memory backup failed; binary left unchanged. In a private directory, run \`umask 077; engram export ./engram-manual-backup.json --all\` (choose a new filename), then retry \`gentle-update toolchain\`."
+backups="$GENTLE_UPDATE_STATE_DIR/engram-backups"
+engram_db="$HOME/.engram/engram.db"
+backup_files() { find "$backups" -maxdepth 1 -type f -name 'engram-*.json' ! -name 'engram-manual.json' 2>/dev/null | LC_ALL=C sort; }
+
+for scenario in pending mismatch matching stopped unknown unavailable export-failed fresh no-data held; do
+  reset
+  rm -rf "$backups" "$HOME/.engram" "$SANDBOX/custom Engram"
+  rm -f "$SANDBOX/engram-ps" "$SANDBOX/engram-ps-unavailable" "$SANDBOX/fail-engram-export"
+  if [ "$scenario" = mismatch ]; then
+    # Honor a configured data directory even when the default does not exist.
+    export ENGRAM_DATA_DIR="$SANDBOX/custom Engram"
+  fi
+  engram_db="${ENGRAM_DATA_DIR:-$HOME/.engram}/engram.db"
+  mkdir -p "${engram_db%/*}"
+  printf 'sandbox SQLite fixture\n' > "$engram_db"
+  case "$scenario" in
+    pending|mismatch)
+      printf '%s\n' 'Status: running' 'Installed version: 3.7.2' 'Server version: 3.7.1' > "$SANDBOX/engram-ps"
+      if [ "$scenario" = pending ]; then
+        printf '%s\n' 'Restart pending: run engram restart' >> "$SANDBOX/engram-ps"
+        # Also exercise the explicit pending flag, independent of parsing versions.
+        sed -i '/Server version:/d' "$SANDBOX/engram-ps"
+      fi ;;
+    matching|unknown)
+      server=3.7.2
+      if [ "$scenario" = unknown ]; then server=unknown; fi
+      printf '%s\n' 'Status: running' 'Installed version: v3.7.2' "Server version: $server" > "$SANDBOX/engram-ps"
+      if [ "$scenario" = matching ]; then printf '%s\n' 'Restart pending: no' >> "$SANDBOX/engram-ps"; fi ;;
+    unavailable) touch "$SANDBOX/engram-ps-unavailable" ;;
+    export-failed) touch "$SANDBOX/fail-engram-export" ;;
+    fresh) rm -f "$GENTLE_UPDATE_BIN_DIR/engram" ;;
+    no-data) rm -f "$engram_db" ;;
+    held) touch "$GENTLE_UPDATE_STATE_DIR/holds/engram" ;;
+  esac
+
+  run_split toolchain
+  check_not "$scenario: never invokes Engram lifecycle or Pi setup" grep -qE '^engram (restart|stop|run|start|setup)( |$)' "$STUB_LOG"
+  check_eq "$scenario: curl only checks the Shell release registry" 'curl --disable --fail --silent --max-time 15 https://registry.npmjs.org/gentle-pi/latest' "$(grep '^curl ' "$STUB_LOG")"
+  if [ "$scenario" != no-data ]; then
+    check "$scenario: original database fixture remains unchanged" cmp -s "$engram_db" <(printf 'sandbox SQLite fixture\n')
+  fi
+  case "$scenario" in
+    export-failed)
+      check_eq "$scenario: exits 1" 1 "$RC"
+      check_notice "$scenario" "$ENGRAM_EXPORT_FAILED"
+      check_notice "$scenario" 'engram — update failed (exit 1)'
+      check "$scenario: attempted export" grep -qE '^engram export .+\.json --all$' "$STUB_LOG"
+      check_eq "$scenario: no published or partial backup files" '' "$(find "$backups" -mindepth 1 -print 2>/dev/null)" ;;
+    held)
+      check_eq "$scenario: exits 0" 0 "$RC"
+      check "$scenario: held skip on stdout" grep -qxF '  • engram — held by gentle-rollback (gentle-rollback unhold engram)' <<<"$OUT"
+      check "$scenario: held skip on stderr" grep -qxF $'\033[33m!\033[0m engram — held by gentle-rollback (gentle-rollback unhold engram)' <<<"$ERR"
+      check_not "$scenario: export skipped" grep -q '^engram export ' "$STUB_LOG"
+      check_not "$scenario: no backup directory" test -e "$backups" ;;
+    *)
+      check_eq "$scenario: exits 0" 0 "$RC"
+      check "$scenario: installs the latest v3 release" logged "$ENGRAM_INSTALL"
+      check "$scenario: checks daemon status after installation" test "$(first_line_of '^go install .*cmd/engram@latest$')" -lt "$(first_line_of '^engram ps$')"
+      case "$scenario" in
+        fresh|no-data)
+          check_not "$scenario: export skipped" grep -q '^engram export ' "$STUB_LOG"
+          check_not "$scenario: no backup directory" test -e "$backups"
+          check_eq "$scenario: no backup notice" '' "$(grep -F 'engram memory backup:' <<<"$OUT")" ;;
+        *)
+          backup="$(backup_files)"
+          check "$scenario: snapshot precedes export" test "$(first_line_of '^gentle-rollback snapshot ')" -lt "$(first_line_of '^engram export ')"
+          check "$scenario: export precedes install" test "$(first_line_of '^engram export ')" -lt "$(first_line_of '^go install .*cmd/engram@latest$')"
+          check_eq "$scenario: backup directory mode" 700 "$(stat -c %a "$backups" 2>/dev/null)"
+          check_eq "$scenario: backup file mode" 600 "$(stat -c %a "$backup" 2>/dev/null)"
+          check "$scenario: exported JSON only" cmp -s "$backup" <(printf '%s\n' '{"version":1,"observations":[]}')
+          check "$scenario: reports the backup path" grep -qxF $'\033[32m✓\033[0m '"engram memory backup: $backup" <<<"$OUT" ;;
+      esac
+      case "$scenario" in
+        pending|mismatch) check_notice "$scenario" "$ENGRAM_RESTART Backup: $backup" ;;
+        unknown|unavailable) check_notice "$scenario" "$ENGRAM_UNKNOWN Backup: $backup" ;;
+        *)
+          check_not "$scenario: no server warning on stdout" grep -qF 'engram —' <<<"$OUT"
+          check_not "$scenario: no server warning on stderr" grep -qF 'engram —' <<<"$ERR" ;;
+      esac ;;
+  esac
+  if [ "$scenario" = export-failed ] || [ "$scenario" = held ]; then
+    check_not "$scenario: never replaces the binary" logged "$ENGRAM_INSTALL"
+    check "$scenario: installed binary is unchanged" cmp -s "$GENTLE_UPDATE_BIN_DIR/engram" "$SANDBOX/stub"
+    check_not "$scenario: does not check server status" logged 'engram ps'
+  fi
+  unset ENGRAM_DATA_DIR
+done
+
+reset
+mkdir -p "$backups"
+printf 'user export\n' > "$backups/engram-manual.json"
+mkdir "$backups/nested"
+: > "$backups/nested/engram-20200101T000000.000000000Z-Abcdef01.json"
+ln -s "$backups/engram-manual.json" "$backups/engram-20200101T000000.000000000Z-Abcdef02.json"
+for n in 0 1 2 3; do
+  install_bin_dir
+  run_split toolchain
+  check_eq "retention run $n: exits 0" 0 "$RC"
+  new_backup[n]="$(backup_files | tail -1)"
+  check "$n: records a distinct timestamped backup" grep -qEx 'engram-[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[[:alnum:]]{8}\.json' <<<"${new_backup[n]##*/}"
+done
+check_eq 'retention: exactly three updater exports remain' 3 "$(backup_files | wc -l)"
+check_eq 'retention: only the last three updater exports remain' "$(printf '%s\n' "${new_backup[@]:1}")" "$(backup_files)"
+check 'retention: leaves unrelated exports unchanged' cmp -s "$backups/engram-manual.json" <(printf 'user export\n')
+check 'retention: leaves nested files alone' test -f "$backups/nested/engram-20200101T000000.000000000Z-Abcdef01.json"
+check 'retention: leaves matching symlinks alone' test -L "$backups/engram-20200101T000000.000000000Z-Abcdef02.json"
+check_not 'retention: never invokes Engram lifecycle or Pi setup' grep -qE '^engram (restart|stop|run|start|setup)( |$)' "$STUB_LOG"
+rm -rf "$backups" "$HOME/.engram"
+
+run_split --help
+check 'help describes Engram memory backups' grep -qF 'engram-backups' <<<"$OUT"
+check 'help says the updater never restarts Engram' grep -qF 'never restarts Engram' <<<"$OUT"
 
 if [ "${1:-}" = --v5-only ]; then
   printf '\n%d v5 assertion(s) failed\n' "$FAILS"
