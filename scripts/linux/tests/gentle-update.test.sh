@@ -89,6 +89,7 @@ case "$name $*" in
     [ -e "$SANDBOX/fail-npm-ls" ] && exit 1
     cat "$SANDBOX/npm-globals.json"
     ;;
+  "npm root -g") printf '%s\n' "$SANDBOX/npm-global-root" ;;
   "pnpm ls -g --depth=0 --json") cat "$SANDBOX/pnpm-globals.json" ;;
   "curl "*"https://registry.npmjs.org/gentle-pi/latest") cat "$SANDBOX/shell-latest.json" ;;
   "gentle-shell --version")
@@ -104,6 +105,8 @@ case "$name $*" in
     if [ -e "$SANDBOX/native-no-change" ]; then exit 0; fi
     ln -sfn "versions/$version-1.6.0" "$HOME/.gentle-shell/current"
     ;;
+  "gentle-shell --isolated setup") [ ! -e "$SANDBOX/fail-setup" ] || exit 73 ;;
+  "gentle-shell --isolated update --extensions") [ ! -e "$SANDBOX/fail-shell-extensions" ] || exit 74 ;;
   "go install "*"/v5/cmd/gentle-ai@v5.0.0")
     [ ! -e "$SANDBOX/fail-ai-build" ] || exit 1
     install -m 755 "$SANDBOX/stub" "$GOBIN/gentle-ai"
@@ -167,7 +170,17 @@ install_bin_dir() {
 install_bin_dir
 export PATH="$STUBS:/usr/bin:/bin"
 
+write_npm_identity() {
+  local dir="$SANDBOX/npm-global-root/$1"
+  mkdir -p "$dir"
+  printf '{"name":"%s"}\n' "$2" > "$dir/package.json"
+}
+
 write_npm_globals() {
+  local pkg
+  for pkg in @earendil-works/pi-coding-agent gentle-pi @openai/codex left-pad; do
+    write_npm_identity "$pkg" "$pkg"
+  done
   cat > "$SANDBOX/npm-globals.json" <<'JSON'
 {"name": "lib", "dependencies": {
   "@earendil-works/pi-coding-agent": {"version": "1.0.3"},
@@ -210,6 +223,7 @@ reset() {
     "$SANDBOX/moshi-new-build" "$SANDBOX/doctor-after.json" "$GENTLE_UPDATE_STATE_DIR"/holds/* \
     "$SANDBOX/restore-rc" "$SANDBOX/restore-does-not-fix" "$SANDBOX/fail-npm-ls" \
     "$SANDBOX/fail-mise-env" "$SANDBOX/empty-mise-env" "$SANDBOX/fail-shell-upgrade" \
+    "$SANDBOX/fail-setup" "$SANDBOX/fail-shell-extensions" "$GENTLE_UPDATE_STATE_DIR/gentle-shell-home.pending" \
     "$SANDBOX/break-shell-upgrade" "$SANDBOX/shell-broken" "$SANDBOX/wrong-shell-version" "$SANDBOX/native-no-change" \
     "$SANDBOX/fail-ai-build" "$SANDBOX/invalid-ai-build" "$STUBS/gentle-shell" "$GENTLE_UPDATE_BIN_DIR/gentle-ai" \
     "$SANDBOX/moshi-restarted" "$SANDBOX/doctor-warming" \
@@ -413,6 +427,46 @@ check_eq 'an owner-managed Gentle AI is skipped without failure' 0 "$RC"
 check_notice 'owner-managed Gentle AI' 'gentle-ai — not a standalone installation in the update bin directory; use its installation owner'
 check_not 'a bundled or linked binary is not rebuilt or synced' grep -qE '^go install .*gentle-ai|^gentle-ai sync' "$STUB_LOG"
 check 'the linked binary remains unchanged' cmp -s "$SANDBOX/stub" "$SHELL_PREFIX/bin/gentle-ai"
+
+for scenario in fail-setup fail-shell-extensions; do
+  reset
+  touch "$SANDBOX/$scenario"
+  run_split agents
+  check_eq "$scenario: first run fails after activation" 1 "$RC"
+  check_eq "$scenario: the v5 launcher stays active" 'versions/5.0.0-1.6.0' "$(readlink "$SHELL_PREFIX/current")"
+  if [ "$scenario" = fail-setup ]; then step_name='Gentle Shell setup'; status=73
+  else step_name='Gentle Shell extensions'; status=74; fi
+  check "$scenario: stdout names the failed step" grep -qxF "  • $step_name" <<<"$OUT"
+  check "$scenario: stderr reports the failed step and status" grep -qxF $'\033[33m!\033[0m '"$step_name — update failed (exit $status)" <<<"$ERR"
+  rm -f "$SANDBOX/$scenario"
+  : > "$STUB_LOG"
+  run_split agents
+  check_eq "$scenario: retry exits 0" 0 "$RC"
+  check "$scenario: current Shell retries setup" logged 'gentle-shell --isolated setup'
+  check "$scenario: current Shell retries extensions" logged 'gentle-shell --isolated update --extensions'
+  check "$scenario: stdout reports successful retry" grep -qxF $'\033[32m✓\033[0m Gentle Shell extensions' <<<"$OUT"
+  check_not "$scenario: retry reports no update failed message" grep -qF 'update failed' <<<"$ERR"
+  check_not "$scenario: retry does not upgrade the launcher again" logged "$SHELL_UPGRADE"
+  : > "$STUB_LOG"
+  run_split agents
+  check_eq "$scenario: completed home exits 0" 0 "$RC"
+  check_not "$scenario: completed home is not retried again" grep -qE '^gentle-shell (upgrade|--isolated)' "$STUB_LOG"
+done
+
+reset
+write_npm_identity gs-legacy gentle-pi
+printf '%s\n' '{"dependencies":{"gs-legacy":{"version":"4.0.0","overridden":false},"left-pad":{"version":"1.0.0","overridden":false}}}' > "$SANDBOX/npm-globals.json"
+run_split packages
+check_eq 'npm alias: packages exits 0' 0 "$RC"
+check_eq 'npm alias: no errors or warnings on stderr' '' "$ERR"
+check 'npm alias: exclusion is visible on stdout' grep -qxF '  leaving gs-legacy alone (managed by its installation owner)' <<<"$OUT"
+check_not 'npm alias: gentle-pi alias is not updated' grep -qE '^npm update .* gs-legacy( |$)' "$STUB_LOG"
+check 'npm alias: the ordinary global still updates with scoped allowlist' logged "npm update -g --allow-scripts=$SCRIPT_ALLOWLIST left-pad"
+
+run_split --help
+check_eq 'help exits 0' 0 "$RC"
+check_eq 'help emits no stderr' '' "$ERR"
+check_not 'help does not promise packages installs Moshi hooks in both Pi homes' grep -qF 'and both Pi homes' <<<"$OUT"
 
 if [ "${1:-}" = --v5-only ]; then
   printf '\n%d v5 assertion(s) failed\n' "$FAILS"

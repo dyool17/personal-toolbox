@@ -11,8 +11,9 @@
 #   plugins    Claude Code marketplaces and installed plugins.
 #   packages   Global package managers and standalone binaries.
 #              npm globals, pnpm globals, moshi-hook, mise itself. The
-#              moshi-hook step also installs its hooks for Claude Code, Codex
-#              and both Pi homes.
+#              moshi-hook step refreshes hooks for Claude Code, Codex, and
+#              standalone Pi. Only all can refresh the isolated Shell hooks,
+#              as part of work on that Shell home.
 #   runtimes   Language runtimes managed by mise. NOT part of `all` — see below.
 #
 # Gentle Shell uses its native release upgrade only from a verified bundled
@@ -21,7 +22,7 @@
 # https://github.com/Gentleman-Programming/gentle-shell/releases
 # Follow that release's installer or your package owner's instructions.
 # Only agents, toolchain, and all upgrade Shell. Setup and extension refresh
-# run only when the active Shell matches the version observed before upgrade.
+# run on the verified target and retry there if they did not finish.
 # Separately managed PATH Pi is updated independently of the bundled Pi.
 #
 # `runtimes` is opt-in on purpose. mise installs each runtime into its own
@@ -77,7 +78,8 @@ SHELL_PREFIX="$HOME/.gentle-shell"
 SHELL_LAUNCHER="$SHELL_PREFIX/bin/gentle-shell"
 SHELL_MANUAL='choose an exact v5 release at https://github.com/Gentleman-Programming/gentle-shell/releases and follow its installer or instructions from your package owner'
 STABLE_VERSION='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
-SHELL_UPGRADED=0
+SHELL_HOME_PENDING="$STATE/gentle-shell-home.pending"
+SHELL_HOME_VERSION=''
 AI_READY=0
 # Intentionally narrow: inspect dependency scripts before adding more names.
 NPM_SCRIPT_ALLOWLIST="gentle-pi,@google/genai,protobufjs"
@@ -425,6 +427,17 @@ bundled_shell_version() {
   printf '%s\n' "${BASH_REMATCH[1]}"
 }
 
+# Record only an activation verified by this updater. A marker for a different
+# active version never authorizes home changes, including after native rollback.
+record_pending_shell_home() {
+  local tmp
+  tmp="$(mktemp "$SHELL_HOME_PENDING.XXXXXX")" || return 1
+  if ! { printf '%s\n' "$1" > "$tmp" && mv -fT -- "$tmp" "$SHELL_HOME_PENDING"; }; then
+    rm -f -- "$tmp"
+    return 1
+  fi
+}
+
 upgrade_gentle_shell() {
   local expected="$1" actual
   if ! run_pi_scoped "$SHELL_LAUNCHER" upgrade --channel release </dev/null; then
@@ -436,7 +449,11 @@ upgrade_gentle_shell() {
     warn "Gentle Shell launcher — expected active $expected after upgrade, found $actual; $SHELL_MANUAL"
     return 1
   fi
-  SHELL_UPGRADED=1
+  if ! record_pending_shell_home "$actual"; then
+    warn 'Gentle Shell launcher — activated but could not record pending home setup; check the updater state directory and run Shell setup and extension refresh manually'
+    return 1
+  fi
+  SHELL_HOME_VERSION="$actual"
 }
 
 update_gentle_shell() {
@@ -447,6 +464,10 @@ update_gentle_shell() {
     skip "Gentle Shell launcher — not a verified bundled PATH launcher; $SHELL_MANUAL"
   elif [[ "$current" != [45].* || "$current" == 4.0.* ]]; then
     skip "Gentle Shell launcher — unsupported launcher ($current); $SHELL_MANUAL"
+  elif [[ "$current" == 5.* ]] && [ -f "$SHELL_HOME_PENDING" ] && [ ! -L "$SHELL_HOME_PENDING" ] &&
+      cmp -s "$SHELL_HOME_PENDING" <(printf '%s\n' "$current"); then
+    printf '  retrying unfinished Gentle Shell home setup (%s)\n' "$current"
+    SHELL_HOME_VERSION="$current"
   # Match the upstream latestRelease source. This read cannot pin what the
   # native command resolves later, so independently verify the active result.
   elif ! latest="$(curl --disable --fail --silent --max-time 15 https://registry.npmjs.org/gentle-pi/latest |
@@ -597,7 +618,7 @@ update_herdr_gentle_shell() {
   command -v herdr >/dev/null 2>&1 || return 0
   step herdr-integrations "Herdr agent integrations" herdr sync_herdr_integrations
   step herdr-plugin "Herdr plugins ($HERDR_GS_PLUGIN + sidebar)" herdr sync_herdr_plugin
-  if [ "$SHELL_UPGRADED" = 1 ]; then
+  if shell_home_selected; then
     step gentle-shell "Gentle Shell extension $HERDR_GS_EXTENSION" gentle-shell sync_herdr_extension
   fi
 }
@@ -672,7 +693,8 @@ npm_component() {
 #
 # Never change a global Gentle Shell launcher: only its owner may do that.
 update_npm_globals() {
-  local listing names pkg pkgs=()
+  local listing names pkg root dir identity component pkgs=()
+  local package_name='^(@[A-Za-z0-9_][A-Za-z0-9._-]*/)?[A-Za-z0-9_][A-Za-z0-9._-]*$'
   # A listing that does not parse is not an empty listing: fail the step
   # instead of reporting that there was nothing to update. npm's own error
   # output is left on stderr.
@@ -690,13 +712,33 @@ update_npm_globals() {
     return 1
   fi
 
+  if [ -n "$names" ]; then
+    if ! root="$(npm root -g)" || [[ "$root" != /* ]] || ! root="$(readlink -e -- "$root")" || [ ! -d "$root" ]; then
+      warn 'could not determine npm global package root; npm globals were not updated'
+      return 1
+    fi
+  fi
+
   while read -r pkg; do
     [ -n "$pkg" ] || continue
-    if [ "$pkg" = "$GENTLE_SHELL_NPM_PACKAGE" ]; then
+    component="$(npm_component "$pkg")"
+    if [ "$component" != gentle-shell ]; then
+      # npm lists aliases by their install directory name, not their manifest
+      # name. Read only a manifest inside the global root; leave links alone.
+      dir="$root/$pkg"
+      if [[ ! "$pkg" =~ $package_name ]] || [ "$(readlink -e -- "$dir")" != "$dir" ] ||
+          [ ! -f "$dir/package.json" ] || [ -L "$dir/package.json" ] ||
+          ! identity="$(jq -er '.name | strings' "$dir/package.json" 2>/dev/null)" || [[ ! "$identity" =~ $package_name ]]; then
+        printf '  leaving %s alone (could not verify installed package identity)\n' "$pkg"
+        continue
+      fi
+      if [ "$identity" = "$GENTLE_SHELL_NPM_PACKAGE" ]; then component="$(npm_component "$identity")"; fi
+    fi
+    if [ "$component" = gentle-shell ]; then
       printf '  leaving %s alone (managed by its installation owner)\n' "$pkg"
       continue
     fi
-    if held "$(npm_component "$pkg")"; then
+    if held "$component"; then
       printf '  leaving %s alone (held)\n' "$pkg"
       continue
     fi
@@ -1009,7 +1051,7 @@ for tool in jq flock sha256sum timeout rg; do
 done
 
 wants() { [ "$TARGET" = all ] || [ "$TARGET" = "$1" ]; }
-shell_home_selected() { [ "$SHELL_UPGRADED" = 1 ] && { wants agents || wants toolchain; }; }
+shell_home_selected() { [ -n "$SHELL_HOME_VERSION" ] && ! held gentle-shell; }
 standalone_pi_home() {
   local home
   home="$(readlink -m -- "${PI_HOMES[0]}")" || return 1
@@ -1132,9 +1174,16 @@ if wants agents; then
 fi
 if shell_home_selected; then
   heading "Gentle Shell isolated home"
+  shell_home_failures=${#FAILED[@]}
+  shell_home_skips=${#SKIPPED[@]}
   apply_pi_npm_policy "${PI_HOMES[1]}"
   step gentle-shell "Gentle Shell setup" gentle-shell run_pi_scoped "$SHELL_LAUNCHER" --isolated setup
   step gentle-shell "Gentle Shell extensions" gentle-shell run_pi_scoped "$SHELL_LAUNCHER" --isolated update --extensions
+  if [ "$shell_home_failures" -eq "${#FAILED[@]}" ] && [ "$shell_home_skips" -eq "${#SKIPPED[@]}" ] &&
+      ! rm -f -- "$SHELL_HOME_PENDING"; then
+    FAILED+=("could not clear pending Gentle Shell home setup for $SHELL_HOME_VERSION")
+    warn "could not clear pending Gentle Shell home setup for $SHELL_HOME_VERSION"
+  fi
 fi
 
 if wants agents; then
@@ -1142,7 +1191,7 @@ if wants agents; then
   step claude   "Claude Code" claude   claude update
   step codex    "Codex"       codex    codex update
   step codex-plugins "Codex plugin marketplaces" codex update_codex_plugins
-  if [ "$SHELL_UPGRADED" = 1 ]; then
+  if shell_home_selected; then
     step gentle-shell "Gentle Shell model catalog" gentle-shell "$SHELL_LAUNCHER" --isolated update --models
   fi
   update_herdr

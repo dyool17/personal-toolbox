@@ -36,12 +36,17 @@ The `agents`, `toolchain`, and `all` routes use
 is stable v5. Native upgrade resolves `latest` again; this check is not a version
 pin. The same run performs isolated-home setup, extension refresh, and
 finalization only if the active Shell matches the exact version seen before
-upgrade. A mismatch is reported as a failure without automatic rollback. An
-already-current Shell skips that work.
+upgrade. A mismatch is reported as a failure without automatic rollback. If
+setup or extension refresh fails, the next Shell update run retries both while
+that verified version is still active. A completed, already-current Shell skips
+that work.
 
-`packages` does not upgrade Shell or change its isolated home. Neither npm nor
-pnpm globals will update the legacy `gentle-pi`. PATH Pi is updated separately;
-the updater does not self-update the bundled Pi.
+`packages` does not upgrade Shell or change its isolated home. Moshi refreshes
+standalone Pi hooks when present; isolated Shell hooks only refresh during an
+`all` run that also works on that Shell home. Neither npm nor pnpm globals will
+update the legacy `gentle-pi`; npm also checks installed package names to exclude
+aliases. PATH Pi is updated separately; the updater does not self-update the
+bundled Pi.
 
 If the launcher is absent, old, or not verifiably bundled, or `latest` cannot be
 verified as v5, select an exact v5 tag from the [Gentle Shell releases][shell-releases]
