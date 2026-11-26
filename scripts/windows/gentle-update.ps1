@@ -344,8 +344,9 @@ function Update-PiExtensions {
         if ($_.Source -cmatch $npmSourcePattern) { $Matches[1] }
     })
     $piCommand = Get-Command pi
-    if ($piCommand.CommandType -eq 'Alias') { $piCommand = $piCommand.ResolvedCommand }
-    $usesBatchShim = $piCommand.Path -match '\.(?:cmd|bat)$'
+    if ($piCommand -is [System.Management.Automation.AliasInfo]) { $piCommand = $piCommand.ResolvedCommand }
+    $usesBatchShim = $piCommand -is [System.Management.Automation.ApplicationInfo] -and
+        $piCommand.Path -match '\.(?:cmd|bat)$'
     $targets = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
     foreach ($package in $packages) {
         $source = $package.Source
@@ -354,11 +355,9 @@ function Update-PiExtensions {
             if ($Matches[1] -in $blockedNames) { continue }
             $source = "npm:$($Matches[1])"
         } elseif ($source -cmatch '^(?:git:|(?:https?|ssh|git)://)') {
-            # Allow URL escapes, not %VAR% syntax. Through a batch shim,
-            # even two valid escapes can delimit a cmd.exe variable name.
-            if ($source -cnotmatch '\A(?:[A-Za-z0-9._~:/@+#=\-]|%[0-9A-Fa-f]{2})+\z' -or
-                ($usesBatchShim -and $source -match '%.*%')) {
-                $quoted = ($source -replace '[\x00-\x1f\x7f]', '?').Replace("'", "''")
+            # Allow only complete URL escapes, not raw percent signs.
+            if ($source -cnotmatch '\A(?:[A-Za-z0-9._~:/@+#=\-]|%[0-9A-Fa-f]{2})+\z') {
+                $quoted = ($source -replace '[\x00-\x1f\x7f]', '?') -replace '[\u0027\u2018\u2019\u201A\u201B]', '$0$0'
                 Add-Skip "Pi extensions — Git source '$quoted' needs a manual update. Review the source, then use a native Pi executable or PowerShell shim: pi update --extension '$quoted'"
                 continue
             }
@@ -372,8 +371,22 @@ function Update-PiExtensions {
 
     $failed = @()
     foreach ($source in $targets.Keys) {
-        $output = @(pi update --extension $source 2>&1)
-        $status = $LASTEXITCODE
+        if ($usesBatchShim -and $source.Contains('%')) {
+            # cmd expands the carrier once, without rescanning the URL's percent
+            # escapes. Invoke the shim directly, not via CALL (a second expansion).
+            $cmd = Join-Path ([Environment]::SystemDirectory) 'cmd.exe'
+            $previousCommand = $env:GENTLE_UPDATE_PI_SHIM_COMMAND
+            try {
+                $env:GENTLE_UPDATE_PI_SHIM_COMMAND = '"{0}" update --extension "{1}"' -f $piCommand.Path, $source
+                $output = @(& $cmd /d /v:off /c '%GENTLE_UPDATE_PI_SHIM_COMMAND%' 2>&1)
+                $status = $LASTEXITCODE
+            } finally {
+                $env:GENTLE_UPDATE_PI_SHIM_COMMAND = $previousCommand
+            }
+        } else {
+            $output = @(pi update --extension $source 2>&1)
+            $status = $LASTEXITCODE
+        }
         if ($status -ne 0) {
             # Read-only inventory included project entries even when the saved
             # trust check used by update hides them.
