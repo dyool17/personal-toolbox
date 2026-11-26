@@ -79,6 +79,7 @@ $BinDir = if ($env:GENTLE_UPDATE_BIN_DIR) { $env:GENTLE_UPDATE_BIN_DIR } else { 
 $GentleAiPkg = 'github.com/gentleman-programming/gentle-ai/v5/cmd/gentle-ai@v5.0.0'
 $EngramPkg = 'github.com/Gentleman-Programming/engram/v3/cmd/engram@latest'
 $GentleShellReleases = 'https://github.com/Gentleman-Programming/gentle-shell/releases'
+$NpmRegistry = 'https://registry.npmjs.org/'
 $NpmNamePattern = '(?:@[A-Za-z0-9_][A-Za-z0-9._-]*/)?[A-Za-z0-9_][A-Za-z0-9._-]*'
 
 $Failed  = New-Object System.Collections.Generic.List[string]
@@ -135,6 +136,9 @@ function Show-Versions {
     foreach ($t in 'claude', 'codex', 'opencode', 'pi', 'herdr', 'gentle-ai', 'engram', 'mise', 'qmd') {
         '  {0,-12} {1}' -f $t, (Get-VersionOf $t)
     }
+    $shellVersion = Get-VersionOf 'gentle-shell'
+    if (-not $shellVersion -or $shellVersion -eq 'unknown') { $shellVersion = '—' }
+    '  {0,-12} {1}' -f 'gentle-pi', $shellVersion
 }
 
 # --- toolchain ---------------------------------------------------------------
@@ -215,9 +219,9 @@ function Get-PiPackages {
         elseif ($line -eq 'No packages installed.' -and $lines.Count -eq 1) { return }
         elseif (-not $line.Trim()) { continue }
         elseif ($scope -and $line -match '^ {2}(\S.*?)(?: \(filtered\))?$') {
-            $entries += [pscustomobject]@{ Scope = $scope; Source = $Matches[1]; Installed = $false }
-        } elseif ($entries.Count -gt 0 -and $line -match '^ {4}\S') {
-            $entries[-1].Installed = $true
+            $entries += [pscustomobject]@{ Scope = $scope; Source = $Matches[1]; InstalledPath = $null }
+        } elseif ($entries.Count -gt 0 -and $line -match '^ {4}(\S.*)$' -and -not $entries[-1].InstalledPath) {
+            $entries[-1].InstalledPath = $Matches[1]
         } else {
             throw 'unexpected output from pi list; Pi packages left unchanged'
         }
@@ -236,16 +240,38 @@ function Test-GentleShellSource {
 }
 
 function Update-GentlePi {
+    $manual = "For an installer-managed launcher with upgrade support, run 'gentle-shell upgrade --channel release' manually; otherwise follow the official installer guidance: $GentleShellReleases/tag/v5.0.0"
     if (Get-Command gentle-shell -ErrorAction SilentlyContinue) {
-        Add-GentleShellSkip 'gentle-pi — a Gentle Shell launcher is on PATH; use its installation owner'
+        Add-Skip "gentle-pi — a Gentle Shell launcher is on PATH. $manual"
+        return
+    }
+    if (-not (Get-Command pi -ErrorAction SilentlyContinue)) {
+        Add-Skip "gentle-pi — standalone Pi is not on PATH. $manual"
         return
     }
 
-    try { $packages = @(Get-PiPackages) } catch {
-        Add-GentleShellSkip 'gentle-pi — unable to verify the Pi package inventory; extension left unchanged'
+    try {
+        $shellPackages = @(foreach ($entry in (Get-PiPackages)) {
+            # Pi reports the installed path for each scope, including local
+            # aliases. Read only a drive-local package manifest, never execute it.
+            if ($entry.InstalledPath -notmatch '^[A-Za-z]:[\\/]') { throw 'missing or non-local package path' }
+            $manifestPath = Join-Path $entry.InstalledPath 'package.json'
+            $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -AsHashtable -NoEnumerate
+            if ($manifest -isnot [System.Collections.IDictionary] -or
+                $manifest['name'] -isnot [string] -or $manifest['name'] -cnotmatch "^$NpmNamePattern\z") {
+                throw 'no usable package identity'
+            }
+            if ($manifest.name -eq 'gentle-pi' -or (Test-GentleShellSource $entry.Source)) {
+                if ($entry.Source -cmatch '^npm:gentle-pi(?:@|$)' -and $manifest.name -cne 'gentle-pi') {
+                    throw 'Gentle Shell manifest disagrees with its npm source'
+                }
+                $entry
+            }
+        })
+    } catch {
+        Add-GentleShellSkip 'gentle-pi — unable to verify all Pi package identities; extension left unchanged'
         return
     }
-    $shellPackages = @($packages | Where-Object { Test-GentleShellSource $_.Source })
     # Pi can replace the version of the same user npm package without adding
     # a second source. Git, project, custom pins and aliases need owner review.
     if ($shellPackages.Count -ne 1 -or $shellPackages[0].Scope -ne 'User' -or
@@ -258,11 +284,20 @@ function Update-GentlePi {
     $version = $null
     if (Get-Command npm -ErrorAction SilentlyContinue) {
         try {
-            $json = npm view 'gentle-pi@5' version --json --registry=https://registry.npmjs.org/ 2>$null
-            if ($LASTEXITCODE -eq 0 -and $json) {
-                $published = ($json -join "`n") | ConvertFrom-Json -ErrorAction Stop
-                $version = $published |
-                    Where-Object { $_ -is [string] -and $_ -cmatch '^5\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' } |
+            $offline = npm config get offline 2>$null
+            if ($LASTEXITCODE -ne 0 -or ($offline -join "`n").Trim() -cne 'false') {
+                Add-GentleShellSkip 'gentle-pi — npm is offline or its offline setting could not be verified; extension left unchanged'
+                return
+            }
+            # Request the registry directly: npm view can fall back to a stale
+            # cache on a network error even with --prefer-online.
+            $metadata = Invoke-RestMethod -Uri "${NpmRegistry}gentle-pi" -TimeoutSec 15 -MaximumRedirection 0 -Headers @{
+                Accept = 'application/vnd.npm.install-v1+json'
+                'Cache-Control' = 'no-cache'
+            }
+            if ($metadata.name -ceq 'gentle-pi') {
+                $version = $metadata.versions.PSObject.Properties.Name |
+                    Where-Object { $_ -cmatch '^5\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' } |
                     ForEach-Object { [version]$_ } | Sort-Object -Descending | Select-Object -First 1
             }
         } catch { $version = $null }
@@ -278,12 +313,20 @@ function Update-GentlePi {
         Add-Skip "gentle-pi — keeping newer configured source $($current.Source)"
         return
     }
-    if ($current.Source -ceq $source -and $current.Installed) {
+    if ($current.Source -ceq $source) {
         Write-Host "  $source is already configured and installed"
         return
     }
-    pi install $source --no-approve
-    if ($LASTEXITCODE -ne 0) { throw "pi install failed for $source" }
+    # Pi has no --registry option. Pass the same registry to its npm child;
+    # a custom Pi package-manager command can override or ignore npm settings.
+    $previousRegistry = $env:NPM_CONFIG_REGISTRY
+    try {
+        $env:NPM_CONFIG_REGISTRY = $NpmRegistry
+        pi install $source --no-approve
+        if ($LASTEXITCODE -ne 0) { throw "pi install failed for $source" }
+    } finally {
+        $env:NPM_CONFIG_REGISTRY = $previousRegistry
+    }
     Write-Warn "Installed $source. Restart Pi, then run 'gentle-ai sync'."
 }
 
@@ -300,6 +343,9 @@ function Update-PiExtensions {
     $blockedNames = @($protected | ForEach-Object {
         if ($_.Source -cmatch $npmSourcePattern) { $Matches[1] }
     })
+    $piCommand = Get-Command pi
+    if ($piCommand.CommandType -eq 'Alias') { $piCommand = $piCommand.ResolvedCommand }
+    $usesBatchShim = $piCommand.Path -match '\.(?:cmd|bat)$'
     $targets = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
     foreach ($package in $packages) {
         $source = $package.Source
@@ -308,10 +354,12 @@ function Update-PiExtensions {
             if ($Matches[1] -in $blockedNames) { continue }
             $source = "npm:$($Matches[1])"
         } elseif ($source -cmatch '^(?:git:|(?:https?|ssh|git)://)') {
-            # Project data is untrusted at discovery. Pass only simple Git
-            # specs to the Windows Pi launcher (which can be a batch shim).
-            if ($source -cnotmatch '\A[A-Za-z0-9._~:/@+#=\-]+\z') {
-                Add-Skip 'Pi extensions — a Git source needs a manual update'
+            # Allow URL escapes, not %VAR% syntax. Through a batch shim,
+            # even two valid escapes can delimit a cmd.exe variable name.
+            if ($source -cnotmatch '\A(?:[A-Za-z0-9._~:/@+#=\-]|%[0-9A-Fa-f]{2})+\z' -or
+                ($usesBatchShim -and $source -match '%.*%')) {
+                $quoted = ($source -replace '[\x00-\x1f\x7f]', '?').Replace("'", "''")
+                Add-Skip "Pi extensions — Git source '$quoted' needs a manual update. Review the source, then use a native Pi executable or PowerShell shim: pi update --extension '$quoted'"
                 continue
             }
         } else {
@@ -497,7 +545,7 @@ if (Test-Wants 'toolchain') {
     Invoke-Step -Name 'gentle-ai' -Binary 'go' -Action { Install-GoRelease -Name 'gentle-ai' -Pkg $GentleAiPkg }
     Invoke-Step -Name 'engram'    -Binary 'go' -Action { Install-GoRelease -Name 'engram'    -Pkg $EngramPkg }
     Sync-GentleAiDevOverride
-    Invoke-Step -Name 'gentle-pi' -Binary 'pi' -ChecksExitCode -Action { Update-GentlePi }
+    Invoke-Step -Name 'gentle-pi' -Binary '-' -ChecksExitCode -Action { Update-GentlePi }
     Invoke-Step -Name 'gentle-ai sync' -Binary 'gentle-ai' -Action { gentle-ai sync }
 }
 
