@@ -38,8 +38,10 @@ pin. The same run performs isolated-home setup, extension refresh, and
 finalization only if the active Shell matches the exact version seen before
 upgrade. A mismatch is reported as a failure without automatic rollback. If
 setup or extension refresh fails, the next Shell update run retries both while
-that verified version is still active. A completed, already-current Shell skips
-that work.
+that verified version is still active. The updater rechecks the active version
+before changing the isolated home and before clearing the pending work. If it
+observes a mismatch, it stops Shell-home work and keeps the pending marker.
+A completed, already-current Shell skips that work.
 
 `packages` does not upgrade Shell or change its isolated home. Moshi refreshes
 standalone Pi hooks when present; isolated Shell hooks only refresh during an

@@ -105,8 +105,20 @@ case "$name $*" in
     if [ -e "$SANDBOX/native-no-change" ]; then exit 0; fi
     ln -sfn "versions/$version-1.6.0" "$HOME/.gentle-shell/current"
     ;;
-  "gentle-shell --isolated setup") [ ! -e "$SANDBOX/fail-setup" ] || exit 73 ;;
-  "gentle-shell --isolated update --extensions") [ ! -e "$SANDBOX/fail-shell-extensions" ] || exit 74 ;;
+  "pi update --all")
+    if [ -e "$SANDBOX/native-rollback-during-pi" ]; then
+      ln -sfn versions/5.0.0-1.6.0 "$HOME/.gentle-shell/current"
+    fi ;;
+  "gentle-shell --isolated setup")
+    [ ! -e "$SANDBOX/fail-setup" ] || exit 73
+    if [ -e "$SANDBOX/native-rollback-during-setup" ]; then
+      ln -sfn versions/5.0.0-1.6.0 "$HOME/.gentle-shell/current"
+    fi ;;
+  "gentle-shell --isolated update --extensions")
+    [ ! -e "$SANDBOX/fail-shell-extensions" ] || exit 74
+    if [ -e "$SANDBOX/native-rollback-during-extensions" ]; then
+      ln -sfn versions/5.0.0-1.6.0 "$HOME/.gentle-shell/current"
+    fi ;;
   "go install "*"/v5/cmd/gentle-ai@v5.0.0")
     [ ! -e "$SANDBOX/fail-ai-build" ] || exit 1
     install -m 755 "$SANDBOX/stub" "$GOBIN/gentle-ai"
@@ -467,6 +479,31 @@ run_split --help
 check_eq 'help exits 0' 0 "$RC"
 check_eq 'help emits no stderr' '' "$ERR"
 check_not 'help does not promise packages installs Moshi hooks in both Pi homes' grep -qF 'and both Pi homes' <<<"$OUT"
+
+for phase in pi setup extensions; do
+  reset
+  fixture_shell 5.1.0
+  rm -rf "$GENTLE_SHELL_HOME/npm"
+  pending="$GENTLE_UPDATE_STATE_DIR/gentle-shell-home.pending"
+  printf '5.1.0\n' > "$pending"
+  flag="$SANDBOX/native-rollback-during-$phase"
+  touch "$flag"
+  run_split agents
+  rm -f "$flag"
+  check_eq "rollback during $phase: exits 1" 1 "$RC"
+  check_eq "rollback during $phase: 5.0.0 remains active" 'versions/5.0.0-1.6.0' "$(readlink "$SHELL_PREFIX/current")"
+  check "rollback during $phase: pending version is unchanged byte-for-byte" cmp -s "$pending" <(printf '5.1.0\n')
+  check_notice "rollback during $phase" "Gentle Shell home — expected active 5.1.0, found 5.0.0; $SHELL_MANUAL"
+  case "$phase" in
+    pi)
+      check_not 'rollback before setup: no isolated commands' grep -q '^gentle-shell --isolated' "$STUB_LOG"
+      check_not 'rollback before setup: no home policy changes' test -e "$GENTLE_SHELL_HOME/npm" ;;
+    setup|extensions)
+      expected='gentle-shell --isolated setup'
+      if [ "$phase" = extensions ]; then expected+=$'\ngentle-shell --isolated update --extensions'; fi
+      check_eq "rollback during $phase: no further isolated commands" "$expected" "$(grep '^gentle-shell --isolated' "$STUB_LOG")" ;;
+  esac
+done
 
 if [ "${1:-}" = --v5-only ]; then
   printf '\n%d v5 assertion(s) failed\n' "$FAILS"

@@ -80,6 +80,7 @@ SHELL_MANUAL='choose an exact v5 release at https://github.com/Gentleman-Program
 STABLE_VERSION='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
 SHELL_HOME_PENDING="$STATE/gentle-shell-home.pending"
 SHELL_HOME_VERSION=''
+SHELL_HOME_READY=0
 AI_READY=0
 # Intentionally narrow: inspect dependency scripts before adding more names.
 NPM_SCRIPT_ALLOWLIST="gentle-pi,@google/genai,protobufjs"
@@ -597,7 +598,9 @@ sync_herdr_extension() {
     # Already declared: `update --extensions` above refreshed it.
     return 0
   fi
-  run_pi_scoped "$SHELL_LAUNCHER" --isolated install "$HERDR_GS_EXTENSION"
+  if verify_shell_home_target; then
+    run_pi_scoped "$SHELL_LAUNCHER" --isolated install "$HERDR_GS_EXTENSION"
+  fi
 }
 
 # Herdr's per-agent integrations (the hook or extension it drops into each
@@ -618,7 +621,7 @@ update_herdr_gentle_shell() {
   command -v herdr >/dev/null 2>&1 || return 0
   step herdr-integrations "Herdr agent integrations" herdr sync_herdr_integrations
   step herdr-plugin "Herdr plugins ($HERDR_GS_PLUGIN + sidebar)" herdr sync_herdr_plugin
-  if shell_home_selected; then
+  if verify_shell_home_target; then
     step gentle-shell "Gentle Shell extension $HERDR_GS_EXTENSION" gentle-shell sync_herdr_extension
   fi
 }
@@ -825,7 +828,7 @@ update_moshi_hook() {
         if standalone_pi_home && [ -d "$home" ]; then
           PI_CODING_AGENT_DIR="$home" moshi-hook install --target pi || status=1
         fi
-        if shell_home_selected && [ -d "${PI_HOMES[1]}" ]; then
+        if [ -d "${PI_HOMES[1]}" ] && verify_shell_home_target; then
           PI_CODING_AGENT_DIR="${PI_HOMES[1]}" moshi-hook install --target pi || status=1
         fi
         ;;
@@ -1051,7 +1054,21 @@ for tool in jq flock sha256sum timeout rg; do
 done
 
 wants() { [ "$TARGET" = all ] || [ "$TARGET" = "$1" ]; }
-shell_home_selected() { [ -n "$SHELL_HOME_VERSION" ] && ! held gentle-shell; }
+# The native launcher resolves current on each invocation. A rollback outside
+# our lock can invalidate the earlier selection; stop all further home work
+# and leave its pending marker in place as soon as we observe a mismatch.
+verify_shell_home_target() {
+  local actual message
+  [ -n "$SHELL_HOME_VERSION" ] && ! held gentle-shell || return 1
+  actual="$(bundled_shell_version)" || actual=unverified
+  if [ "$actual" != "$SHELL_HOME_VERSION" ]; then
+    message="Gentle Shell home — expected active $SHELL_HOME_VERSION, found $actual; $SHELL_MANUAL"
+    FAILED+=("$message")
+    warn "$message"
+    SHELL_HOME_VERSION=''
+    return 1
+  fi
+}
 standalone_pi_home() {
   local home
   home="$(readlink -m -- "${PI_HOMES[0]}")" || return 1
@@ -1172,17 +1189,19 @@ if wants agents; then
     step pi "Pi model catalog" pi pi update --models
   fi
 fi
-if shell_home_selected; then
+if verify_shell_home_target; then
   heading "Gentle Shell isolated home"
   shell_home_failures=${#FAILED[@]}
   shell_home_skips=${#SKIPPED[@]}
   apply_pi_npm_policy "${PI_HOMES[1]}"
-  step gentle-shell "Gentle Shell setup" gentle-shell run_pi_scoped "$SHELL_LAUNCHER" --isolated setup
-  step gentle-shell "Gentle Shell extensions" gentle-shell run_pi_scoped "$SHELL_LAUNCHER" --isolated update --extensions
-  if [ "$shell_home_failures" -eq "${#FAILED[@]}" ] && [ "$shell_home_skips" -eq "${#SKIPPED[@]}" ] &&
-      ! rm -f -- "$SHELL_HOME_PENDING"; then
-    FAILED+=("could not clear pending Gentle Shell home setup for $SHELL_HOME_VERSION")
-    warn "could not clear pending Gentle Shell home setup for $SHELL_HOME_VERSION"
+  if verify_shell_home_target; then
+    step gentle-shell "Gentle Shell setup" gentle-shell run_pi_scoped "$SHELL_LAUNCHER" --isolated setup
+    if verify_shell_home_target; then
+      step gentle-shell "Gentle Shell extensions" gentle-shell run_pi_scoped "$SHELL_LAUNCHER" --isolated update --extensions
+      if [ "$shell_home_failures" -eq "${#FAILED[@]}" ] && [ "$shell_home_skips" -eq "${#SKIPPED[@]}" ]; then
+        SHELL_HOME_READY=1
+      fi
+    fi
   fi
 fi
 
@@ -1191,7 +1210,7 @@ if wants agents; then
   step claude   "Claude Code" claude   claude update
   step codex    "Codex"       codex    codex update
   step codex-plugins "Codex plugin marketplaces" codex update_codex_plugins
-  if shell_home_selected; then
+  if verify_shell_home_target; then
     step gentle-shell "Gentle Shell model catalog" gentle-shell "$SHELL_LAUNCHER" --isolated update --models
   fi
   update_herdr
@@ -1228,9 +1247,11 @@ fi
 
 hash -r 2>/dev/null || true
 
-if shell_home_selected; then
-  dedupe_gentle_shell_home
-  sync_gentle_shell_mcp
+if verify_shell_home_target; then dedupe_gentle_shell_home; fi
+if verify_shell_home_target; then sync_gentle_shell_mcp; fi
+if [ "$SHELL_HOME_READY" = 1 ] && verify_shell_home_target && ! rm -f -- "$SHELL_HOME_PENDING"; then
+  FAILED+=("could not clear pending Gentle Shell home setup for $SHELL_HOME_VERSION")
+  warn "could not clear pending Gentle Shell home setup for $SHELL_HOME_VERSION"
 fi
 check_pi_homes
 smoke_check
