@@ -145,7 +145,11 @@ case "$name $*" in
   "claude plugin list")         echo "demo@market" ;;
   "claude update")
     if [ -e "$SANDBOX/break-claude" ]; then touch "$SANDBOX/claude-broken"; fi
-    if [ -e "$SANDBOX/break-shell-after-snapshot" ]; then touch "$SANDBOX/shell-broken"; fi ;;
+    if [ -e "$SANDBOX/break-shell-after-snapshot" ]; then touch "$SANDBOX/shell-broken"; fi
+    case "${SHELL_KIND_SWITCH:-}" in
+      bundle-to-legacy) rm -f "$SANDBOX/stubs/gentle-shell"; install -m 755 "$SANDBOX/stub" "$SANDBOX/stubs/gentle-shell" ;;
+      legacy-to-bundle) ln -sfn "$HOME/.gentle-shell/bin/gentle-shell" "$SANDBOX/stubs/gentle-shell" ;;
+    esac ;;
   "claude --version")           [ -e "$SANDBOX/claude-broken" ] && exit 1; echo "2.1.289 (Claude Code)" ;;
   "go env GOPATH")              echo "$SANDBOX/gopath" ;;
   "moshi-hook doctor --json")
@@ -284,7 +288,7 @@ check_notice() {
 
 # --- stable v5 and ownership --------------------------------------------------
 
-for scenario in old absent shadowed incomplete absolute-current not-v5 unknown current held; do
+for scenario in old absent shadowed incomplete broken-current absolute-current not-v5 unknown current held; do
   reset
   case "$scenario" in
     old) fixture_shell 4.0.0; message="unsupported launcher (4.0.0); $SHELL_MANUAL" ;;
@@ -296,6 +300,9 @@ for scenario in old absent shadowed incomplete absolute-current not-v5 unknown c
       message="not a verified bundled PATH launcher; $SHELL_MANUAL" ;;
     incomplete)
       echo 'installing 4.1.0-1.6.0 1234' > "$SHELL_PREFIX/current/.gentle-shell-version"
+      message="not a verified bundled PATH launcher; $SHELL_MANUAL" ;;
+    broken-current)
+      ln -sfn versions/9.9.9-1.6.0 "$SHELL_PREFIX/current"
       message="not a verified bundled PATH launcher; $SHELL_MANUAL" ;;
     absolute-current)
       ln -sfn "$SHELL_PREFIX/versions/4.1.0-1.6.0" "$SHELL_PREFIX/current"
@@ -523,37 +530,56 @@ check_not 'symlinked HOME stderr does not reject launcher ownership' grep -qF 'n
 check 'symlinked HOME upgrades natively' logged "$SHELL_UPGRADE"
 check_not 'symlinked HOME never uses legacy install or restore' grep -qE '^npm install --global|^gentle-rollback restore' "$STUB_LOG"
 
+reset
+ln -s . "$SANDBOX/install-parent"
+ln -s . "$SANDBOX/run-parent"
+install_home="$SANDBOX/install-parent/home"
+run_home="$SANDBOX/run-parent/home"
+SHELL_PREFIX="$install_home/.gentle-shell" fixture_shell 4.1.0
+HOME="$run_home" run_split agents
+check_eq 'equivalent HOME aliases exit 0' 0 "$RC"
+check 'equivalent HOME aliases upgrade natively' logged "$SHELL_UPGRADE"
+check_eq 'equivalent HOME aliases activate v5' versions/5.0.0-1.6.0 "$(readlink "$SHELL_PREFIX/current")"
+check 'equivalent HOME aliases report the upgrade' grep -qxF '  gentle-shell gentle-shell 4.1.0 -> gentle-shell 5.0.0  (upgraded)' <<<"$OUT"
+check_not 'equivalent HOME aliases do not reject launcher ownership' grep -qF 'not a verified bundled PATH launcher' <<<"$ERR"
+
 for kind in legacy bundled; do
   reset
-  fixture_shell 5.0.0
+  SHELL_PREFIX="$install_home/.gentle-shell" fixture_shell 5.0.0
   if [ "$kind" = legacy ]; then
     rm -f "$STUBS/gentle-shell"
     install -m 755 "$SANDBOX/stub" "$STUBS/gentle-shell"
+    kind_switch=legacy-to-bundle
+  else
+    kind_switch=bundle-to-legacy
   fi
   touch "$SANDBOX/break-shell-after-snapshot"
-  run_split agents
+  HOME="$run_home" SHELL_KIND_SWITCH="$kind_switch" run_split agents
   rm -f "$SANDBOX/break-shell-after-snapshot"
   check_eq "$kind smoke failure exits 1" 1 "$RC"
   check "$kind smoke failure is reported on stderr" grep -qxF $'\033[33m!\033[0m gentle-shell no longer runs after the update' <<<"$ERR"
   if [ "$kind" = legacy ]; then
+    check 'legacy-to-bundle switch occurred' test -L "$STUBS/gentle-shell"
     check 'legacy smoke failure uses the snapshot' logged 'gentle-rollback restore 20260101-000000 --only gentle-shell --yes'
     check 'legacy recovery is reported on stdout' grep -qxF '  • gentle-shell broke after the update; rolled back and held' <<<"$OUT"
   else
+    check_not 'bundle-to-legacy switch occurred' test -L "$STUBS/gentle-shell"
     check_not 'bundled smoke failure never uses legacy restore' grep -q '^gentle-rollback restore' "$STUB_LOG"
     check 'bundled recovery points to native rollback on stdout' grep -qxF "  • gentle-shell broke after the update; use native 'gentle-shell upgrade --rollback' if available; otherwise $SHELL_MANUAL" <<<"$OUT"
   fi
 done
 
 reset
+SHELL_PREFIX="$install_home/.gentle-shell" fixture_shell 4.1.0
 touch "$SANDBOX/fail-shell-catalog"
-run_split agents
+HOME="$install_home" run_split agents
 rm -f "$SANDBOX/fail-shell-catalog"
 check_eq 'catalog failure exits 1' 1 "$RC"
 check 'catalog failure appears on stdout' grep -qxF '  • Gentle Shell model catalog' <<<"$OUT"
 check 'catalog failure appears on stderr' grep -qxF $'\033[33m!\033[0m Gentle Shell model catalog — update failed (exit 75)' <<<"$ERR"
 check 'catalog failure preserves exact pending version' cmp -s "$pending" <(printf '5.0.0\n')
 : > "$STUB_LOG"
-run_split agents
+HOME="$run_home" run_split agents
 check_eq 'catalog retry exits 0' 0 "$RC"
 check 'catalog retry reports success' grep -qxF $'\033[32m✓\033[0m Gentle Shell model catalog' <<<"$OUT"
 check_not 'catalog retry does not reinstall the launcher' logged "$SHELL_UPGRADE"

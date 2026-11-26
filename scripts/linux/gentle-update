@@ -405,16 +405,23 @@ update_gentle_ai() {
   fi
 }
 
+shell_realpath() { readlink -e -- "$1"; }
+
 # Identify the generated launcher independently of the active release's health.
-# A shadowing npm/pnpm copy is not the bundle.
+# Parse its generated exec line as data, never source it to extract a path.
 bundled_shell_prefix() {
-  local prefix path
-  prefix="$(readlink -f -- "$SHELL_PREFIX")" && path="$(type -P gentle-shell)" &&
-    [ "$(readlink -f -- "$path")" = "$prefix/bin/gentle-shell" ] || return 1
-  [ -O "$prefix" ] && [ -O "$SHELL_LAUNCHER" ] && [ -x "$SHELL_LAUNCHER" ] || return 1
-  grep -Fxq '# gentle-shell bundled launcher (generated; do not edit)' "$SHELL_LAUNCHER" &&
-    grep -Fq -e "'$prefix/current/node_modules/gentle-pi/bin/gentle-shell.mjs' \"\$@\"" \
-      -e "'$SHELL_PREFIX/current/node_modules/gentle-pi/bin/gentle-shell.mjs' \"\$@\"" "$SHELL_LAUNCHER" || return 1
+  local prefix path launcher line embedded quoted="([^']|'\\\\'')*" escape="'\\''"
+  local pattern="^exec '$quoted' '(/$quoted)/current/node_modules/gentle-pi/bin/gentle-shell\.mjs' \"\\\$@\"$"
+  prefix="$(shell_realpath "$SHELL_PREFIX")" && path="$(type -P gentle-shell)" &&
+    launcher="$(shell_realpath "$SHELL_LAUNCHER")" && [[ "$launcher" = "$prefix/bin/gentle-shell" ]] &&
+    [ "$(shell_realpath "$path")" = "$launcher" ] || return 1
+  [ -O "$prefix" ] && [ -O "$launcher" ] && [ -x "$launcher" ] || return 1
+  grep -Fxq '# gentle-shell bundled launcher (generated; do not edit)' "$launcher" || return 1
+  line="$(grep -Em1 '^exec ' "$launcher")" && [[ "$line" =~ $pattern ]] || return 1
+  embedded="${BASH_REMATCH[2]//$escape/\'}"
+  # The matched suffix is fixed. Resolve its prefix here so a broken current
+  # does not turn an otherwise identifiable bundle into a legacy launcher.
+  [ "$(shell_realpath "$embedded")" = "$prefix" ] || return 1
   printf '%s\n' "$prefix"
 }
 
@@ -425,13 +432,16 @@ bundled_shell_version() {
   local versions="^gentle-shell ($STABLE_VERSION)"$'\n'"pi ($STABLE_VERSION)\$"
   prefix="$(bundled_shell_prefix)" || return 1
   [ -L "$prefix/current" ] || return 1
-  active="$(readlink -f -- "$prefix/current")" || return 1
+  active="$(shell_realpath "$prefix/current")" || return 1
   id="${active##*/}"
   marker="$active/.gentle-shell-version"
-  [ "$(readlink -- "$prefix/current")" = "versions/$id" ] && [ "$active" = "$prefix/versions/$id" ] &&
+  # Native Shell requires this relative pointer, even if an absolute link
+  # could reach the same release. Keep the release inside its physical root.
+  [ "$(readlink -- "$prefix/current")" = "versions/$id" ] && [ "${active%/*}" = "$prefix/versions" ] &&
+    [ "$active" = "$(shell_realpath "$prefix/versions/$id")" ] &&
     [ -f "$marker" ] && [ ! -L "$marker" ] && [ -O "$marker" ] &&
     cmp -s "$marker" <(printf '%s\n' "$id") || return 1
-  entry="$(readlink -f -- "$active/node_modules/gentle-pi/bin/gentle-shell.mjs")" || return 1
+  entry="$(shell_realpath "$active/node_modules/gentle-pi/bin/gentle-shell.mjs")" || return 1
   [[ "$entry" = "$active/"* ]] && [ -f "$entry" ] || return 1
   output="$(timeout 20 env -u GENTLE_SHELL_VERIFY_VERSION "$SHELL_LAUNCHER" --version 2>/dev/null </dev/null)" || return 1
   [[ "$output" =~ $versions ]] &&
