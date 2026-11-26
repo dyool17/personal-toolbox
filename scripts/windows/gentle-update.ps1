@@ -12,15 +12,21 @@
       agents     AI coding agents, each through its own updater -> latest stable.
                  Claude Code, Codex, OpenCode, Pi. (herdr is included here too —
                  see the Windows note below.)
-      toolchain  Gentleman source builds pinned to the tip of main.
-                 gentle-ai, engram, gentle-pi, then `gentle-ai sync`.
+      toolchain  Stable Gentleman releases: Gentle AI v5.0.0, latest Engram
+                 v3, and the latest stable Gentle Shell v5 for an existing
+                 npm-based Pi extension, then `gentle-ai sync`.
       plugins    Claude Code marketplaces and installed plugins.
       packages   Global package managers and standalone binaries.
                  npm globals, pnpm globals, moshi-hook, mise itself.
       runtimes   Language runtimes managed by mise. NOT part of `all` — see below.
 
-    Agents run before the toolchain so gentle-pi is rebuilt against an already
-    current Pi, and so `gentle-ai sync` observes the final agent configuration.
+    Agents run before the toolchain so `gentle-ai sync` observes the updated
+    agent configuration. General Pi, npm, and pnpm updates leave Gentle Shell
+    alone. Native launchers, legacy Git extensions, ambiguous installations,
+    and unverifiable v5 releases require manual action. See:
+    https://github.com/Gentleman-Programming/gentle-shell/releases
+    After a Gentle Shell extension update, restart Pi and run `gentle-ai sync`.
+    The Engram binary update does not restart or migrate its server.
 
     `runtimes` is opt-in on purpose. mise installs each runtime into its own
     directory and npm globals do not carry across Node versions, so bumping Node
@@ -32,7 +38,7 @@
     - claude/codex/opencode/pi/mise/moshi-hook are the same Node/Go/Rust CLIs on
       Windows and expose the identical subcommands used here (`claude update`,
       `codex update`, `opencode upgrade`, `pi update --self`,
-      `pi update --extensions`, `mise upgrade`/`mise self-update`,
+      `pi update --extension <source>`, `mise upgrade`/`mise self-update`,
       `moshi-hook update`). Nothing had to be swapped for a store-manager
       equivalent (winget/scoop/choco) because these tools ship their own
       updater on every platform including Windows.
@@ -43,9 +49,9 @@
       signing still pending, "stable path on Windows is still WSL"). It is kept
       in the `packages` group like the original, but failures here are more
       likely on Windows and are reported, never treated as fatal.
-    - `go install ...@main` behaves identically; only the destination changes:
-      GOBIN defaults to `%USERPROFILE%\go\bin` on Windows (vs `$GOPATH/bin` on
-      Unix), and binaries get a `.exe` suffix.
+    - Gentle AI has no official Windows binary archive. The updater uses
+      `go install` with the published version and matching module major.
+      Go binaries get a `.exe` suffix.
 
 .PARAMETER Target
     One of: all, agents, toolchain, plugins, packages, runtimes. Defaults to all.
@@ -69,13 +75,11 @@ $ErrorActionPreference = 'Stop'
 # across %USERPROFILE%\go\bin.
 $BinDir = if ($env:GENTLE_UPDATE_BIN_DIR) { $env:GENTLE_UPDATE_BIN_DIR } else { Join-Path $env:USERPROFILE '.local\bin' }
 
-$GentleAiPkg  = 'github.com/gentleman-programming/gentle-ai/v3/cmd/gentle-ai@main'
-$EngramPkg    = 'github.com/Gentleman-Programming/engram/v2/cmd/engram@main'
-# gentle-pi's GitHub repo was renamed to gentle-shell (still the same npm
-# package, "gentle-pi"; GitHub 301-redirects the old URL, but Pi resolves the
-# checkout directory from the URL it's given, so track the canonical name).
-$GentlePiPkg      = 'git:github.com/Gentleman-Programming/gentle-shell@main'
-$GentlePiCheckout = Join-Path $env:USERPROFILE '.pi\agent\git\github.com\Gentleman-Programming\gentle-shell'
+# Bump the Gentle AI pin (and keep it in sync with Linux) for a new release.
+$GentleAiPkg = 'github.com/gentleman-programming/gentle-ai/v5/cmd/gentle-ai@v5.0.0'
+$EngramPkg = 'github.com/Gentleman-Programming/engram/v3/cmd/engram@latest'
+$GentleShellReleases = 'https://github.com/Gentleman-Programming/gentle-shell/releases'
+$NpmNamePattern = '(?:@[A-Za-z0-9_][A-Za-z0-9._-]*/)?[A-Za-z0-9_][A-Za-z0-9._-]*'
 
 $Failed  = New-Object System.Collections.Generic.List[string]
 $Skipped = New-Object System.Collections.Generic.List[string]
@@ -92,12 +96,14 @@ function Add-Skip {
 }
 
 # Run one update step. Records failures instead of aborting the run, and skips
-# cleanly when the tool is not installed on this machine.
+# cleanly when the tool is not installed on this machine. ChecksExitCode actions
+# throw on real failures themselves (for example, after a failed metadata lookup that can be skipped).
 function Invoke-Step {
     param(
         [string]$Name,
         [string]$Binary,
-        [scriptblock]$Action
+        [scriptblock]$Action,
+        [switch]$ChecksExitCode
     )
 
     if ($Binary -ne '-' -and -not (Get-Command $Binary -ErrorAction SilentlyContinue)) {
@@ -108,7 +114,7 @@ function Invoke-Step {
     Write-Host "`n$Name" -ForegroundColor White
     try {
         & $Action
-        if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "exit code $LASTEXITCODE" }
+        if (-not $ChecksExitCode -and $LASTEXITCODE -and $LASTEXITCODE -ne 0) { throw "exit code $LASTEXITCODE" }
         Write-Ok $Name
     } catch {
         $Failed.Add($Name)
@@ -125,29 +131,18 @@ function Get-VersionOf {
     } catch { return 'unknown' }
 }
 
-function Get-GentlePiCommit {
-    if (-not (Test-Path $GentlePiCheckout)) { return '—' }
-    try {
-        Push-Location $GentlePiCheckout
-        $out = git log -1 --format='%h %cs' 2>$null
-        Pop-Location
-        if ($out) { return $out } else { return 'unknown' }
-    } catch { return 'unknown' }
-}
-
 function Show-Versions {
     foreach ($t in 'claude', 'codex', 'opencode', 'pi', 'herdr', 'gentle-ai', 'engram', 'mise', 'qmd') {
         '  {0,-12} {1}' -f $t, (Get-VersionOf $t)
     }
-    '  {0,-12} {1}' -f 'gentle-pi', (Get-GentlePiCommit)
 }
 
 # --- toolchain ---------------------------------------------------------------
 
-# Build a Go binary from main into $BinDir, keeping one rolling backup.
+# Build a Go release into $BinDir, keeping one rolling backup.
 # GOBIN is set explicitly (same override the bash version relies on) so this
 # never depends on %USERPROFILE%\go\bin being on PATH.
-function Install-FromMain {
+function Install-GoRelease {
     param([string]$Name, [string]$Pkg)
 
     $target = Join-Path $BinDir "$Name.exe"
@@ -199,11 +194,150 @@ function Sync-GentleAiDevOverride {
     Write-Ok "repaired gentle-pi dev binary override -> $target"
 }
 
+function Add-GentleShellSkip {
+    param([string]$Reason)
+    Add-Skip "$Reason. Choose an official v5 release and follow its installation instructions: $GentleShellReleases"
+}
+
+function Get-PiPackages {
+    $PSNativeCommandUseErrorActionPreference = $false
+    # Inspect both scopes for conflicting sources. Approval is for this read-only
+    # inventory only; updates must still use Pi's saved project trust.
+    $lines = @(pi list --approve 2>&1)
+    if ($LASTEXITCODE -ne 0 -or $lines.Count -eq 0) { throw 'could not list Pi packages' }
+
+    $scope = $null
+    $entries = @()
+    foreach ($raw in $lines) {
+        $line = "$raw" -replace '\x1b\[[0-9;]*m', ''
+        if ($line -eq 'User packages:') { $scope = 'User' }
+        elseif ($line -eq 'Project packages:') { $scope = 'Project' }
+        elseif ($line -eq 'No packages installed.' -and $lines.Count -eq 1) { return }
+        elseif (-not $line.Trim()) { continue }
+        elseif ($scope -and $line -match '^ {2}(\S.*?)(?: \(filtered\))?$') {
+            $entries += [pscustomobject]@{ Scope = $scope; Source = $Matches[1]; Installed = $false }
+        } elseif ($entries.Count -gt 0 -and $line -match '^ {4}\S') {
+            $entries[-1].Installed = $true
+        } else {
+            throw 'unexpected output from pi list; Pi packages left unchanged'
+        }
+    }
+    if ($entries.Count -eq 0) { throw 'no usable package list from Pi' }
+    return $entries
+}
+
+function Test-GentleShellSource {
+    param([string]$Source)
+    $decoded = [uri]::UnescapeDataString($Source)
+    if ($decoded -cmatch '^npm:') {
+        return $decoded -match '(?:^|@)npm:\s*gentle-pi(?:@|$)|/gentle-pi/-/gentle-pi-'
+    }
+    return $decoded -match '(?:^|[/:\\])(?:gentle-shell|gentle-pi)(?:\.git)?(?:[/\\@#?]|$)'
+}
+
 function Update-GentlePi {
-    pi update --extension $GentlePiPkg
-    if ($LASTEXITCODE -eq 0) { return }
-    Write-Warn "falling back to a fresh install of $GentlePiPkg"
-    pi install $GentlePiPkg
+    if (Get-Command gentle-shell -ErrorAction SilentlyContinue) {
+        Add-GentleShellSkip 'gentle-pi — a Gentle Shell launcher is on PATH; use its installation owner'
+        return
+    }
+
+    try { $packages = @(Get-PiPackages) } catch {
+        Add-GentleShellSkip 'gentle-pi — unable to verify the Pi package inventory; extension left unchanged'
+        return
+    }
+    $shellPackages = @($packages | Where-Object { Test-GentleShellSource $_.Source })
+    # Pi can replace the version of the same user npm package without adding
+    # a second source. Git, project, custom pins and aliases need owner review.
+    if ($shellPackages.Count -ne 1 -or $shellPackages[0].Scope -ne 'User' -or
+        $shellPackages[0].Source -cnotmatch '^npm:gentle-pi(?:@(?:latest|[45](?:\.(?:0|[1-9]\d*)){0,2}))?$') {
+        Add-GentleShellSkip 'gentle-pi — no unambiguous user npm extension; review Pi sources with pi list before changing them'
+        return
+    }
+
+    $PSNativeCommandUseErrorActionPreference = $false
+    $version = $null
+    if (Get-Command npm -ErrorAction SilentlyContinue) {
+        try {
+            $json = npm view 'gentle-pi@5' version --json --registry=https://registry.npmjs.org/ 2>$null
+            if ($LASTEXITCODE -eq 0 -and $json) {
+                $published = ($json -join "`n") | ConvertFrom-Json -ErrorAction Stop
+                $version = $published |
+                    Where-Object { $_ -is [string] -and $_ -cmatch '^5\.(0|[1-9]\d*)\.(0|[1-9]\d*)$' } |
+                    ForEach-Object { [version]$_ } | Sort-Object -Descending | Select-Object -First 1
+            }
+        } catch { $version = $null }
+    }
+    if (-not $version) {
+        Add-GentleShellSkip 'gentle-pi — could not verify a stable v5 release on npm; extension left unchanged'
+        return
+    }
+
+    $source = "npm:gentle-pi@$version"
+    $current = $shellPackages[0]
+    if ($current.Source -match '^npm:gentle-pi@(5\.\d+\.\d+)$' -and ([version]$Matches[1]) -gt $version) {
+        Add-Skip "gentle-pi — keeping newer configured source $($current.Source)"
+        return
+    }
+    if ($current.Source -ceq $source -and $current.Installed) {
+        Write-Host "  $source is already configured and installed"
+        return
+    }
+    pi install $source --no-approve
+    if ($LASTEXITCODE -ne 0) { throw "pi install failed for $source" }
+    Write-Warn "Installed $source. Restart Pi, then run 'gentle-ai sync'."
+}
+
+function Update-PiExtensions {
+    $PSNativeCommandUseErrorActionPreference = $false
+    $packages = @(Get-PiPackages)
+    $protected = @($packages | Where-Object { Test-GentleShellSource $_.Source })
+    if ($protected.Count -gt 0) {
+        Add-GentleShellSkip 'Pi extensions — Gentle Shell is handled separately by toolchain or its installation owner'
+    }
+    # Pi matches npm packages by name, not by pin, across both scopes. If an
+    # alias is protected in either scope, do not pass its identity to Pi at all.
+    $npmSourcePattern = "^npm:\s*($NpmNamePattern)(?:@.+)?\s*\z"
+    $blockedNames = @($protected | ForEach-Object {
+        if ($_.Source -cmatch $npmSourcePattern) { $Matches[1] }
+    })
+    $targets = [System.Collections.Generic.Dictionary[string,string]]::new([StringComparer]::Ordinal)
+    foreach ($package in $packages) {
+        $source = $package.Source
+        if (Test-GentleShellSource $source) { continue }
+        if ($source -cmatch $npmSourcePattern) {
+            if ($Matches[1] -in $blockedNames) { continue }
+            $source = "npm:$($Matches[1])"
+        } elseif ($source -cmatch '^(?:git:|(?:https?|ssh|git)://)') {
+            # Project data is untrusted at discovery. Pass only simple Git
+            # specs to the Windows Pi launcher (which can be a batch shim).
+            if ($source -cnotmatch '\A[A-Za-z0-9._~:/@+#=\-]+\z') {
+                Add-Skip 'Pi extensions — a Git source needs a manual update'
+                continue
+            }
+        } else {
+            continue  # Pi does not update local-path packages.
+        }
+        if (-not $targets.ContainsKey($source) -or $package.Scope -eq 'User') {
+            $targets[$source] = $package.Scope
+        }
+    }
+
+    $failed = @()
+    foreach ($source in $targets.Keys) {
+        $output = @(pi update --extension $source 2>&1)
+        $status = $LASTEXITCODE
+        if ($status -ne 0) {
+            # Read-only inventory included project entries even when the saved
+            # trust check used by update hides them.
+            if ($targets[$source] -ne 'User' -and $output.Count -eq 1 -and
+                ("$($output[0])" -replace '\x1b\[[0-9;]*m', '') -ceq "Error: No matching package found for $source") {
+                continue
+            }
+            $failed += $source
+        }
+        $output | ForEach-Object { Write-Host "$_" }
+    }
+    if ($failed.Count -gt 0) { throw "Pi extension updates failed: $($failed -join ', ')" }
 }
 
 # --- agents ------------------------------------------------------------------
@@ -265,10 +399,46 @@ function Restore-PnpmBins {
     }
 }
 
+function Get-UpdatableGlobals {
+    param([object[]]$Projects, [string]$Manager)
+    $candidates = @()
+    $excluded = @()
+    foreach ($project in $Projects) {
+        if ($project -isnot [System.Collections.IDictionary] -or $project.Contains('error')) {
+            throw "$Manager did not return a usable global package list"
+        }
+        $deps = $project['dependencies']
+        if ($null -eq $deps) { continue }
+        if ($deps -isnot [System.Collections.IDictionary]) { throw "$Manager returned invalid global dependencies" }
+        foreach ($name in $deps.psbase.Keys) {
+            $pkg = $deps[$name]
+            # npm --long reports the installed manifest name, including npm
+            # aliases. pnpm reports the real package name under 'from' or 'name'.
+            $identities = @(@($pkg.name, $pkg.from) | Where-Object { $_ -is [string] -and $_ -cmatch "^$NpmNamePattern\z" })
+            if ($name -eq 'gentle-pi' -or 'gentle-pi' -in $identities) {
+                Add-GentleShellSkip "$Manager globals — leaving '$name' to its installation owner"
+                $excluded += $name
+            } elseif ($name -cnotmatch "^$NpmNamePattern\z" -or $identities.Count -eq 0) {
+                Add-Skip "$Manager globals — could not verify the identity of '$name'"
+                $excluded += $name
+            } else {
+                $candidates += $name
+            }
+        }
+    }
+    $candidates | Where-Object { $_ -notin $excluded } | Select-Object -Unique
+}
+
 function Update-NpmGlobals {
-    npm update -g
+    $json = npm ls -g --depth=0 --long --json
+    if ($LASTEXITCODE -ne 0 -or -not $json) { throw 'npm ls did not return a usable global package list' }
+    $listing = ($json -join "`n") | ConvertFrom-Json -AsHashtable -NoEnumerate
+    if ($listing -isnot [System.Collections.IDictionary]) { throw 'invalid npm global package list' }
+    $names = @(Get-UpdatableGlobals -Projects @($listing) -Manager npm)
+    if ($names.Count -eq 0) { return }
+    npm update -g @names
     if ($LASTEXITCODE -ne 0) { throw 'npm update -g failed' }
-    Restore-PnpmBins
+    if ($names -contains 'pnpm') { Restore-PnpmBins }
 }
 
 function Update-PnpmGlobals {
@@ -281,7 +451,13 @@ function Update-PnpmGlobals {
     }
     $env:PNPM_HOME = $pnpmHome
     $env:Path = "$pnpmHome;$env:Path"
-    pnpm update -g --latest
+    $json = pnpm ls -g --depth=0 --json
+    if ($LASTEXITCODE -ne 0 -or -not $json) { throw 'pnpm ls did not return a usable global package list' }
+    $listing = ($json -join "`n") | ConvertFrom-Json -AsHashtable -NoEnumerate
+    if ($listing -isnot [array]) { throw 'invalid pnpm global package list' }
+    $names = @(Get-UpdatableGlobals -Projects $listing -Manager pnpm)
+    if ($names.Count -eq 0) { return }
+    pnpm update -g --latest @names
     if ($LASTEXITCODE -ne 0) { throw 'pnpm update -g failed' }
 }
 
@@ -312,16 +488,16 @@ if (Test-Wants 'agents') {
     Invoke-Step -Name 'Codex'            -Binary 'codex'    -Action { codex update }
     Invoke-Step -Name 'OpenCode'         -Binary 'opencode' -Action { opencode upgrade }
     Invoke-Step -Name 'Pi'               -Binary 'pi'       -Action { pi update --self }
-    Invoke-Step -Name 'Pi extensions'    -Binary 'pi'       -Action { pi update --extensions }
+    Invoke-Step -Name 'Pi extensions'    -Binary 'pi'       -ChecksExitCode -Action { Update-PiExtensions }
     Update-Herdr
 }
 
 if (Test-Wants 'toolchain') {
-    Write-Heading 'Gentleman toolchain (tip of main)'
-    Invoke-Step -Name 'gentle-ai' -Binary 'go' -Action { Install-FromMain -Name 'gentle-ai' -Pkg $GentleAiPkg }
-    Invoke-Step -Name 'engram'    -Binary 'go' -Action { Install-FromMain -Name 'engram'    -Pkg $EngramPkg }
+    Write-Heading 'Gentleman toolchain (stable releases)'
+    Invoke-Step -Name 'gentle-ai' -Binary 'go' -Action { Install-GoRelease -Name 'gentle-ai' -Pkg $GentleAiPkg }
+    Invoke-Step -Name 'engram'    -Binary 'go' -Action { Install-GoRelease -Name 'engram'    -Pkg $EngramPkg }
     Sync-GentleAiDevOverride
-    Invoke-Step -Name 'gentle-pi' -Binary 'pi' -Action { Update-GentlePi }
+    Invoke-Step -Name 'gentle-pi' -Binary 'pi' -ChecksExitCode -Action { Update-GentlePi }
     Invoke-Step -Name 'gentle-ai sync' -Binary 'gentle-ai' -Action { gentle-ai sync }
 }
 
