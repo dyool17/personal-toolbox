@@ -41,9 +41,11 @@
 #   - A component held by gentle-rollback is skipped, so a release that was
 #     rolled back is not reinstalled the next day.
 #   - Before replacing an installed Engram with existing data, export memory
-#     with `engram export <file>.json --all`. Keep the newest 3 private exports
-#     under the updater state directory's engram-backups/ (not config backups).
-#     If the export fails, the binary is not replaced. The updater never restarts Engram.
+#     with `engram export <file>.json --all`. Keep this run's private export and
+#     the 2 newest prior updater exports under engram-backups/ in the state directory.
+#     GENTLE_UPDATE_ENGRAM_EXPORT_TIMEOUT sets the export timeout in positive whole
+#     seconds (default: 300). On failure or timeout the binary is not replaced.
+#     The updater never restarts Engram.
 #     When `engram ps` shows a version mismatch, run `engram restart` once sessions
 #     are idle. If needed, run `engram setup pi` and restart Pi manually.
 #   - After the updates every tool that answered `--version` before must still
@@ -323,25 +325,39 @@ install_go_binary() {
 # Export through the old CLI, never by copying a live SQLite database. Publish
 # only a complete export; the leading dot keeps unfinished files out of retention.
 backup_engram() (
-  local dir="$1" stamp pending backup
+  local dir="$1" stamp pending backup seconds="${GENTLE_UPDATE_ENGRAM_EXPORT_TIMEOUT-300}"
+  [[ "$seconds" =~ ^[1-9][0-9]*$ ]] || return 1
   umask 077
   [ ! -L "$dir" ] && mkdir -p -- "$dir" && [ -O "$dir" ] && chmod 700 -- "$dir" || return 1
   stamp="$(date -u '+%Y%m%dT%H%M%S.%NZ')" || return 1
+  [[ "$stamp" =~ ^([0-9]{8}T[0-9]{6})\.([0-9]{9})Z$ ]] || return 1
+  backup="$dir/gentle-update-engram-${BASH_REMATCH[1]}Z-${BASH_REMATCH[2]}.json"
   pending="$(mktemp --suffix=.json -- "$dir/.pending-XXXXXXXX")" || return 1
   trap 'rm -f -- "$pending"' EXIT
-  engram export "$pending" --all >/dev/null 2>&1 && [ -s "$pending" ] && chmod 600 -- "$pending" || return 1
-  backup="$dir/engram-$stamp-${pending##*-}"
+  timeout --kill-after=5s "${seconds}s" engram export "$pending" --all </dev/null >/dev/null 2>&1 || return 1
+  [ -f "$pending" ] && [ ! -L "$pending" ] && [ -s "$pending" ] && chmod 600 -- "$pending" || return 1
   ln -T -- "$pending" "$backup" || return 1
   printf '%s\n' "$backup"
 )
 
 prune_engram_backups() {
-  local dir="$1" old
-  # The private namespace excludes manual exports, symlinks, and subdirectories.
-  find "$dir" -maxdepth 1 -regextype posix-extended -type f \
-    -regex '.*/engram-[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[[:alnum:]]{8}\.json' -printf '%f\n' \
-    | LC_ALL=C sort -r | tail -n +4 \
-    | while IFS= read -r old; do rm -- "$dir/$old" || exit 1; done
+  local dir="$1" current="${2##*/}" old kept=0
+  [ -d "$dir" ] && [ ! -L "$dir" ] && [ -O "$dir" ] || return 1
+  # Only the reserved namespace qualifies. Keep this run's export regardless
+  # of the clock, then keep the two newest other exports by embedded UTC time.
+  find -P "$dir" -maxdepth 1 -regextype posix-extended -type f \
+    -regex '^.*/gentle-update-engram-[0-9]{8}T[0-9]{6}Z-[0-9]{9}\.json$' -printf '%f\n' \
+    | LC_ALL=C sort -r \
+    | while IFS= read -r old; do
+        [ "$old" != "$current" ] || continue
+        old="$dir/$old"
+        [ -f "$old" ] && [ ! -L "$old" ] && [ -O "$old" ] || continue
+        if [ "$kept" -lt 2 ]; then
+          kept=$((kept + 1))
+        else
+          rm -- "$old" || exit 1
+        fi
+      done
 }
 
 # ps describes the managed daemon; --version only describes the executable.
@@ -384,7 +400,7 @@ update_engram() {
       return 1
     fi
     ok "engram memory backup: $backup"
-    prune_engram_backups "$dir" || warn "engram — could not prune older memory backups under $dir"
+    prune_engram_backups "$dir" "$backup" || warn "engram — could not prune older memory backups under $dir"
   fi
   install_go_binary engram "$ENGRAM_PKG" || return $?
   hash -r

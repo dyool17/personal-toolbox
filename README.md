@@ -70,15 +70,20 @@ its own Gentle AI runtime.
 `toolchain` and `all` install the latest Engram v3 release unless Engram is held.
 Before replacing an installed Engram with an existing database (`~/.engram` or
 `ENGRAM_DATA_DIR`), the updater uses the old binary to run
-`engram export <file>.json --all`. The three newest timestamped updater exports
-are kept in `engram-backups/` under the updater state directory (by default
-`~/.local/state/gentle-update`). The directory is mode `0700` and each export
-is mode `0600`. These files contain sensitive memory, not configuration. No
-raw SQLite files are copied, and the regular rollback snapshot does not restore
-Engram memory.
+`engram export <file>.json --all`. In `engram-backups/` under the updater state
+directory (by default `~/.local/state/gentle-update`), the updater keeps the
+current export plus the two newest prior updater exports by UTC timestamp, even
+if the clock moves backward. Retention only uses the reserved
+`gentle-update-engram-YYYYMMDDTHHMMSSZ-NNNNNNNNN.json` format; older naming
+formats and manual exports are left alone. The directory is mode `0700` and
+each export is mode `0600`. These files contain sensitive memory, not
+configuration. No raw SQLite files are copied, and the regular rollback snapshot
+does not restore Engram memory.
 
-If the export fails, the updater reports the failure and leaves the binary
-unchanged. In a private directory, try
+The export timeout defaults to 300 seconds. Set
+`GENTLE_UPDATE_ENGRAM_EXPORT_TIMEOUT` to a positive whole number of seconds to
+override it. If the export fails or times out, the updater reports the failure
+and leaves the binary unchanged. In a private directory, try
 `umask 077; engram export ./engram-manual-backup.json --all` with a new filename.
 Resolve the backup failure before retrying `gentle-update toolchain`. Fresh
 installs and installs without a database do not need an export.

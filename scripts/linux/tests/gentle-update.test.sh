@@ -45,7 +45,7 @@ export GENTLE_SHELL_HOME="$HOME/.gentle-shell/agent"
 export CLAUDE_CONFIG_DIR="$HOME/.claude"
 export PNPM_HOME="$SANDBOX/pnpm"
 # The run must not depend on the shell the tests were started from.
-unset GENTLE_UPDATE_LOCK_HELD GENTLE_UPDATE_NO_SNAPSHOT GENTLE_UPDATE_LOG_DIR GENTLE_UPDATE_NO_LOG GENTLE_UPDATE_TRACE XDG_STATE_HOME MISE_SHELL HERDR_ENV GENTLE_PI_CONFIG_HOME GENTLE_AI_HOME GENTLE_AI_PI_CONFIG_DIR ENGRAM_DATA_DIR
+unset GENTLE_UPDATE_LOCK_HELD GENTLE_UPDATE_NO_SNAPSHOT GENTLE_UPDATE_LOG_DIR GENTLE_UPDATE_NO_LOG GENTLE_UPDATE_TRACE XDG_STATE_HOME MISE_SHELL HERDR_ENV GENTLE_PI_CONFIG_HOME GENTLE_AI_HOME GENTLE_AI_PI_CONFIG_DIR ENGRAM_DATA_DIR GENTLE_UPDATE_ENGRAM_EXPORT_TIMEOUT
 
 APP="$SANDBOX/app"
 STUBS="$SANDBOX/stubs"
@@ -131,6 +131,7 @@ case "$name $*" in
     if [ ! -e "$SANDBOX/invalid-ai-build" ]; then echo '# v5 build' >> "$GOBIN/gentle-ai"; fi
     ;;
   "go install github.com/Gentleman-Programming/engram/v3/cmd/engram@latest")
+    [ ! -e "$SANDBOX/fail-engram-install" ] || exit 19
     install -m 755 "$SANDBOX/stub" "$GOBIN/engram"
     printf '# new Engram build\n' >> "$GOBIN/engram"
     ;;
@@ -139,9 +140,15 @@ case "$name $*" in
     ;;
   "engram export "*".json --all")
     grep -qxF '# new Engram build' "$0" && exit 71
+    [ ! -e "$SANDBOX/empty-engram-export" ] || exit 0
     printf '%s\n' '{"version":1,"observations":[]}' > "$2"
+    if [ -p "$SANDBOX/engram-export-fifo" ]; then exec tail -f "$SANDBOX/engram-export-fifo"; fi
     [ ! -e "$SANDBOX/fail-engram-export" ] || exit 72
     ;;
+  "date -u "*)
+    if [ -s "$SANDBOX/engram-backup-clock" ]; then cat "$SANDBOX/engram-backup-clock"; else exec /usr/bin/date "$@"; fi
+    ;;
+  "date "*) exec /usr/bin/date "$@" ;;
   "engram ps")
     grep -qxF '# new Engram build' "$0" || exit 73
     if [ -e "$SANDBOX/engram-ps-unavailable" ]; then
@@ -300,7 +307,9 @@ first_line_of() { grep -nE -- "$1" "$STUB_LOG" | head -1 | cut -d: -f1; }
 
 # Focused v5 cases capture both streams and mutation logs independently.
 run_split() {
-  GENTLE_UPDATE_NO_LOG=1 "$APP/gentle-update" "$@" >"$SANDBOX/stdout" 2>"$SANDBOX/stderr" </dev/null
+  local -a watchdog=()
+  if [ "$1" = --watchdog ]; then watchdog=(timeout -k 1s 5s); shift; fi
+  GENTLE_UPDATE_NO_LOG=1 "${watchdog[@]}" "$APP/gentle-update" "$@" >"$SANDBOX/stdout" 2>"$SANDBOX/stderr" </dev/null
   RC=$?
   OUT=$(<"$SANDBOX/stdout")
   ERR=$(<"$SANDBOX/stderr")
@@ -617,12 +626,17 @@ ENGRAM_UNKNOWN="engram — the running server version could not be confirmed wit
 ENGRAM_EXPORT_FAILED="engram — memory backup failed; binary left unchanged. In a private directory, run \`umask 077; engram export ./engram-manual-backup.json --all\` (choose a new filename), then retry \`gentle-update toolchain\`."
 backups="$GENTLE_UPDATE_STATE_DIR/engram-backups"
 engram_db="$HOME/.engram/engram.db"
-backup_files() { find "$backups" -maxdepth 1 -type f -name 'engram-*.json' ! -name 'engram-manual.json' 2>/dev/null | LC_ALL=C sort; }
+backup_files() {
+  find "$backups" -maxdepth 1 -type f \( -name 'engram-*.json' -o -name 'gentle-update-engram-*.json' \) \
+    ! -name 'engram-manual.json' ! -name '*-Personal.json' 2>/dev/null | LC_ALL=C sort
+}
+reported_backup() { sed -n 's/^.*engram memory backup: //p' <<<"$OUT"; }
 
-for scenario in pending mismatch matching stopped unknown unavailable export-failed fresh no-data held; do
+for scenario in pending mismatch matching stopped unknown unavailable export-failed export-empty backup-dir-symlink export-timeout fresh no-data held; do
   reset
   rm -rf "$backups" "$HOME/.engram" "$SANDBOX/custom Engram"
-  rm -f "$SANDBOX/engram-ps" "$SANDBOX/engram-ps-unavailable" "$SANDBOX/fail-engram-export"
+  rm -f "$SANDBOX/engram-ps" "$SANDBOX/engram-ps-unavailable" "$SANDBOX/fail-engram-export" \
+    "$SANDBOX/empty-engram-export" "$SANDBOX/engram-export-fifo"
   if [ "$scenario" = mismatch ]; then
     # Honor a configured data directory even when the default does not exist.
     export ENGRAM_DATA_DIR="$SANDBOX/custom Engram"
@@ -645,24 +659,40 @@ for scenario in pending mismatch matching stopped unknown unavailable export-fai
       if [ "$scenario" = matching ]; then printf '%s\n' 'Restart pending: no' >> "$SANDBOX/engram-ps"; fi ;;
     unavailable) touch "$SANDBOX/engram-ps-unavailable" ;;
     export-failed) touch "$SANDBOX/fail-engram-export" ;;
+    export-empty) touch "$SANDBOX/empty-engram-export" ;;
+    backup-dir-symlink)
+      mkdir -m 755 "$SANDBOX/other-backups"
+      ln -s "$SANDBOX/other-backups" "$backups" ;;
+    export-timeout) mkfifo "$SANDBOX/engram-export-fifo" ;;
     fresh) rm -f "$GENTLE_UPDATE_BIN_DIR/engram" ;;
     no-data) rm -f "$engram_db" ;;
     held) touch "$GENTLE_UPDATE_STATE_DIR/holds/engram" ;;
   esac
 
-  run_split toolchain
+  if [ "$scenario" = export-timeout ]; then
+    GENTLE_UPDATE_ENGRAM_EXPORT_TIMEOUT=1 run_split --watchdog toolchain
+  else
+    run_split toolchain
+  fi
   check_not "$scenario: never invokes Engram lifecycle or Pi setup" grep -qE '^engram (restart|stop|run|start|setup)( |$)' "$STUB_LOG"
   check_eq "$scenario: curl only checks the Shell release registry" 'curl --disable --fail --silent --max-time 15 https://registry.npmjs.org/gentle-pi/latest' "$(grep '^curl ' "$STUB_LOG")"
   if [ "$scenario" != no-data ]; then
     check "$scenario: original database fixture remains unchanged" cmp -s "$engram_db" <(printf 'sandbox SQLite fixture\n')
   fi
   case "$scenario" in
-    export-failed)
+    export-*|backup-dir-symlink)
       check_eq "$scenario: exits 1" 1 "$RC"
       check_notice "$scenario" "$ENGRAM_EXPORT_FAILED"
       check_notice "$scenario" 'engram — update failed (exit 1)'
-      check "$scenario: attempted export" grep -qE '^engram export .+\.json --all$' "$STUB_LOG"
-      check_eq "$scenario: no published or partial backup files" '' "$(find "$backups" -mindepth 1 -print 2>/dev/null)" ;;
+      check_eq "$scenario: no published or partial backup files" '' "$(find "$backups" -mindepth 1 -print 2>/dev/null)"
+      check_eq "$scenario: no reported backup" '' "$(reported_backup)"
+      if [ "$scenario" = backup-dir-symlink ]; then
+        check_not "$scenario: never invokes export" grep -q '^engram export ' "$STUB_LOG"
+        check_eq "$scenario: target unchanged" 755 "$(stat -c %a "$SANDBOX/other-backups")"
+        check_eq "$scenario: target stays empty" '' "$(find "$SANDBOX/other-backups" -mindepth 1 -print)"
+      else
+        check "$scenario: attempted export" grep -qE '^engram export .+\.json --all$' "$STUB_LOG"
+      fi ;;
     held)
       check_eq "$scenario: exits 0" 0 "$RC"
       check "$scenario: held skip on stdout" grep -qxF '  • engram — held by gentle-rollback (gentle-rollback unhold engram)' <<<"$OUT"
@@ -695,7 +725,7 @@ for scenario in pending mismatch matching stopped unknown unavailable export-fai
           check_not "$scenario: no server warning on stderr" grep -qF 'engram —' <<<"$ERR" ;;
       esac ;;
   esac
-  if [ "$scenario" = export-failed ] || [ "$scenario" = held ]; then
+  if [[ "$scenario" = export-* || "$scenario" = backup-dir-symlink || "$scenario" = held ]]; then
     check_not "$scenario: never replaces the binary" logged "$ENGRAM_INSTALL"
     check "$scenario: installed binary is unchanged" cmp -s "$GENTLE_UPDATE_BIN_DIR/engram" "$SANDBOX/stub"
     check_not "$scenario: does not check server status" logged 'engram ps'
@@ -706,26 +736,50 @@ done
 reset
 mkdir -p "$backups"
 printf 'user export\n' > "$backups/engram-manual.json"
+lookalike="$backups/engram-19990101T000000.000000000Z-Personal.json"
+printf 'operator-owned\n' > "$lookalike"
 mkdir "$backups/nested"
-: > "$backups/nested/engram-20200101T000000.000000000Z-Abcdef01.json"
-ln -s "$backups/engram-manual.json" "$backups/engram-20200101T000000.000000000Z-Abcdef02.json"
+nested="$backups/nested/gentle-update-engram-20200101T000000Z-000000001.json"
+link="$backups/gentle-update-engram-20200101T000000Z-000000002.json"
+: > "$nested"
+ln -s "$backups/engram-manual.json" "$link"
+install -m 755 "$SANDBOX/stub" "$STUBS/date"
 for n in 0 1 2 3; do
   install_bin_dir
+  printf '2031010%dT000000.000000000Z\n' "$((n + 2))" > "$SANDBOX/engram-backup-clock"
   run_split toolchain
   check_eq "retention run $n: exits 0" 0 "$RC"
-  new_backup[n]="$(backup_files | tail -1)"
-  check "$n: records a distinct timestamped backup" grep -qEx 'engram-[0-9]{8}T[0-9]{6}\.[0-9]{9}Z-[[:alnum:]]{8}\.json' <<<"${new_backup[n]##*/}"
+  new_backup[n]="$(reported_backup)"
+  check_eq "$n: records a distinct timestamped backup" "gentle-update-engram-2031010$((n + 2))T000000Z-000000000.json" "${new_backup[n]##*/}"
 done
 check_eq 'retention: exactly three updater exports remain' 3 "$(backup_files | wc -l)"
 check_eq 'retention: only the last three updater exports remain' "$(printf '%s\n' "${new_backup[@]:1}")" "$(backup_files)"
 check 'retention: leaves unrelated exports unchanged' cmp -s "$backups/engram-manual.json" <(printf 'user export\n')
-check 'retention: leaves nested files alone' test -f "$backups/nested/engram-20200101T000000.000000000Z-Abcdef01.json"
-check 'retention: leaves matching symlinks alone' test -L "$backups/engram-20200101T000000.000000000Z-Abcdef02.json"
+check 'retention: preserves the operator look-alike byte-for-byte' cmp -s "$lookalike" <(printf 'operator-owned\n')
+check 'retention: leaves nested files alone' test -f "$nested"
+check 'retention: leaves matching symlinks alone' test -L "$link"
 check_not 'retention: never invokes Engram lifecycle or Pi setup' grep -qE '^engram (restart|stop|run|start|setup)( |$)' "$STUB_LOG"
+
+reset
+printf '20310101T000000.000000000Z\n' > "$SANDBOX/engram-backup-clock"
+touch "$SANDBOX/fail-engram-install"
+run_split toolchain
+backup="$(reported_backup)"
+check_eq 'backward clock and failed install: exits 1' 1 "$RC"
+check_notice 'backward clock and failed install' 'engram — update failed (exit 19)'
+check 'backward clock: installer was attempted' logged "$ENGRAM_INSTALL"
+check 'backward clock: installed binary is unchanged' cmp -s "$GENTLE_UPDATE_BIN_DIR/engram" "$SANDBOX/stub"
+check 'backward clock: reported backup still contains the exported data' cmp -s "$backup" <(printf '%s\n' '{"version":1,"observations":[]}')
+check_eq 'backward clock: keeps the reported backup and the two newest older-run backups' \
+  "$(printf '%s\n' "$backup" "${new_backup[@]:2}")" "$(backup_files)"
+check_not 'backward clock: does not check server status after installation failure' logged 'engram ps'
+check_not 'backward clock: never invokes Engram lifecycle or Pi setup' grep -qE '^engram (restart|stop|run|start|setup)( |$)' "$STUB_LOG"
+rm -f "$STUBS/date" "$SANDBOX/engram-backup-clock" "$SANDBOX/fail-engram-install"
 rm -rf "$backups" "$HOME/.engram"
 
 run_split --help
 check 'help describes Engram memory backups' grep -qF 'engram-backups' <<<"$OUT"
+check 'help documents the Engram export timeout' grep -qF 'GENTLE_UPDATE_ENGRAM_EXPORT_TIMEOUT' <<<"$OUT"
 check 'help says the updater never restarts Engram' grep -qF 'never restarts Engram' <<<"$OUT"
 
 if [ "${1:-}" = --v5-only ]; then
