@@ -7,7 +7,7 @@ Three scripts keep the local agent tooling current and recoverable:
 
 | Script | What it does |
 |---|---|
-| `gentle-update` | Updates agents, the Gentleman toolchain, Claude plugins, and global packages. Snapshots first, skips held components, and rolls back a tool that stops running. |
+| `gentle-update` | Updates agents, the Gentleman toolchain, Claude plugins, and global packages. Snapshots first, skips held components, and attempts rollback where supported if a tool stops running. |
 | `gentle-rollback` | Takes snapshots, restores components from one, and manages holds. |
 | `gentle-reset` | Clears stale state, caches, leftover temp files, and long-lived daemons, then runs `gentle-update`. |
 
@@ -27,6 +27,36 @@ systemctl --user enable --now "$PWD/scripts/linux/systemd/gentle-update.timer"
 systemctl --user list-timers gentle-update.timer   # next run
 journalctl --user -u gentle-update -e               # last run
 ```
+
+### Gentle Shell and Gentle AI on Linux
+
+The `agents`, `toolchain`, and `all` routes use
+`gentle-shell upgrade --channel release` only for a verified bundled PATH launcher
+(4.1.0 or newer in major 4 or 5) and only when the official npm `latest` release
+is stable v5. Native upgrade resolves `latest` again; this check is not a version
+pin. The same run performs isolated-home setup, extension refresh, and
+finalization only if the active Shell matches the exact version seen before
+upgrade. A mismatch is reported as a failure without automatic rollback. An
+already-current Shell skips that work.
+
+`packages` does not upgrade Shell or change its isolated home. Neither npm nor
+pnpm globals will update the legacy `gentle-pi`. PATH Pi is updated separately;
+the updater does not self-update the bundled Pi.
+
+If the launcher is absent, old, or not verifiably bundled, or `latest` cannot be
+verified as v5, select an exact v5 tag from the [Gentle Shell releases][shell-releases]
+and follow that release's installer or your package owner's instructions. The
+daily update never migrates or removes a global installation. For bundled Shell
+recovery, use `gentle-shell upgrade --rollback` if available, or the installer;
+`gentle-rollback` does not restore the managed prefix.
+
+`toolchain` and `all` build standalone Gentle AI from the official v5.0.0 Go
+module and sync installed agents using that validated binary. Only the standalone
+binary in the update bin directory is managed; linked or separately managed
+binaries and development override records are left alone. The Shell bundle has
+its own Gentle AI runtime.
+
+[shell-releases]: https://github.com/Gentleman-Programming/gentle-shell/releases
 
 ### Run logs
 

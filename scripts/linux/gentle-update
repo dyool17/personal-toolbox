@@ -6,11 +6,8 @@
 #   agents     AI coding agents and their runtimes -> latest stable.
 #              Claude Code, Codex, Pi runtime, Gentle Shell, herdr.
 #   toolchain  Gentleman tools -> latest official release (never main).
-#              gentle-ai and engram are built from their latest release. The
-#              standalone Gentle Shell home is provisioned by its launcher
-#              instead of syncing the regular Pi home. `gentle-ai sync` then
-#              brings the installed skills, agents and instructions up to the
-#              build that was just built.
+#              Standalone gentle-ai is pinned to stable v5.0.0 and synced
+#              only from a validated build. Engram tracks its release channel.
 #   plugins    Claude Code marketplaces and installed plugins.
 #   packages   Global package managers and standalone binaries.
 #              npm globals, pnpm globals, moshi-hook, mise itself. The
@@ -18,8 +15,14 @@
 #              and both Pi homes.
 #   runtimes   Language runtimes managed by mise. NOT part of `all` — see below.
 #
-# The standalone launcher is updated before its isolated home is provisioned.
-# The PATH Pi runtime is updated separately; Gentle Shell does not update Pi itself.
+# Gentle Shell uses its native release upgrade only from a verified bundled
+# launcher when the official latest is v5. Native upgrade resolves latest again;
+# it has no exact-tag pin. Otherwise choose an exact v5 tag at:
+# https://github.com/Gentleman-Programming/gentle-shell/releases
+# Follow that release's installer or your package owner's instructions.
+# Only agents, toolchain, and all upgrade Shell. Setup and extension refresh
+# run only when the active Shell matches the version observed before upgrade.
+# Separately managed PATH Pi is updated independently of the bundled Pi.
 #
 # `runtimes` is opt-in on purpose. mise installs each runtime into its own
 # directory and npm globals do not carry across Node versions, so bumping Node
@@ -37,9 +40,9 @@
 #   - A component held by gentle-rollback is skipped, so a release that was
 #     rolled back is not reinstalled the next day.
 #   - After the updates every tool that answered `--version` before must still
-#     answer. One that does not is rolled back to the pre-update snapshot and
-#     held, and the run is reported as failed. When it cannot be rolled back it
-#     is held anyway and reported for what happened.
+#     answer. Failures use snapshot rollback where supported. For bundled Shell
+#     recovery, use its own `gentle-shell upgrade --rollback` if available, or
+#     its installer; gentle-rollback cannot restore the managed prefix.
 #
 # Every run writes a log to ~/.local/state/gentle-update/logs (the newest 30
 # are kept; `latest.log` points at the last one). It holds the full output plus
@@ -65,19 +68,19 @@ set -uo pipefail
 BIN_DIR="${GENTLE_UPDATE_BIN_DIR:-$HOME/.local/bin}"
 # State shared with gentle-rollback: snapshots, holds, and the lock.
 STATE="${GENTLE_UPDATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gentle-update}"
-# Module paths carry the major version and change on every major release:
-# when a new major ships, bump /v4 and /v3 here. The suffix is the channel:
-# `@latest` resolves to the newest tagged release and never to a prerelease or
-# main.
-GENTLE_AI_PKG="github.com/gentleman-programming/gentle-ai/v4/cmd/gentle-ai@latest"
+GENTLE_AI_MODULE="github.com/gentleman-programming/gentle-ai"
+GENTLE_AI_VERSION=v5.0.0
+GENTLE_AI_PKG="$GENTLE_AI_MODULE/v5/cmd/gentle-ai@$GENTLE_AI_VERSION"
 ENGRAM_PKG="github.com/Gentleman-Programming/engram/v3/cmd/engram@latest"
-# The npm package name remains gentle-pi; it installs the gentle-shell command.
 GENTLE_SHELL_NPM_PACKAGE="gentle-pi"
+SHELL_PREFIX="$HOME/.gentle-shell"
+SHELL_LAUNCHER="$SHELL_PREFIX/bin/gentle-shell"
+SHELL_MANUAL='choose an exact v5 release at https://github.com/Gentleman-Programming/gentle-shell/releases and follow its installer or instructions from your package owner'
+STABLE_VERSION='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+SHELL_UPGRADED=0
+AI_READY=0
 # Intentionally narrow: inspect dependency scripts before adding more names.
 NPM_SCRIPT_ALLOWLIST="gentle-pi,@google/genai,protobufjs"
-# Commit of a launcher installed from git, read by gentle-rollback. The update
-# installs the registry release, which has no commit, and removes this record.
-GENTLE_SHELL_COMMIT_FILE="$STATE/gentle-shell.commit"
 PI_NPM_PACKAGE="@earendil-works/pi-coding-agent"
 CODEX_NPM_PACKAGE="@openai/codex"
 PNPM_GLOBAL_HOME="${PNPM_HOME:-$HOME/.local/share/pnpm}"
@@ -281,17 +284,17 @@ report_versions() {
 
 # --- toolchain ---------------------------------------------------------------
 
-# Build a Go binary into BIN_DIR from the module version its package path
-# names. The previous
-# build is not copied aside here: the pre-update snapshot already holds it,
-# and `gentle-rollback restore --only <name>` brings it back.
+# Keep builds outside any local Go module and ignore inherited build flags.
+build_go_binary() { ( cd "$1" && GOBIN="$2" GOFLAGS='' go install "$3" ); }
+
+# The previous build is already in the pre-update snapshot.
 install_go_binary() {
   local name="$1" pkg="$2"
 
   # A throwaway working directory keeps the build out of any local Go module.
   local workdir
   workdir="$(mktemp -d)" || return 1
-  ( cd "$workdir" && GOBIN="$BIN_DIR" GOFLAGS='' go install "$pkg" )
+  build_go_binary "$workdir" "$BIN_DIR" "$pkg"
   local status=$?
   rm -rf "$workdir"
   [ $status -eq 0 ] || return $status
@@ -307,19 +310,10 @@ install_go_binary() {
   done
 }
 
-# gentle-pi can be pinned to a locally built gentle-ai through a registration
-# file, and it refuses to fall back silently while that override is declared.
-# Rebuilding gentle-ai into BIN_DIR removes the shadowing copy the override may
-# still name, so repair a *broken* override here. An override whose binary
-# still exists is a deliberate choice and is never redirected.
-# A new gentle-ai binary does not rewrite what the previous one installed: the
-# skills, agent definitions and instructions on disk stay at the old build
-# until `gentle-ai sync` runs.
-#
-# sync fails the whole run when one installed agent has no runtime, so an agent
-# whose CLI is missing is left out and reported instead.
+# Preserve the installed agent filter; do not invoke an unqualified sync when
+# every installed agent was filtered out.
 sync_gentle_ai_assets() {
-  local state="${GENTLE_AI_HOME:-$HOME/.gentle-ai}/state.json"
+  local runtime="$1" state="${GENTLE_AI_HOME:-$HOME/.gentle-ai}/state.json"
   local agent binary agents=() dropped=0
 
   while read -r agent; do
@@ -328,7 +322,10 @@ sync_gentle_ai_assets() {
       claude-code) binary=claude ;;
       *)           binary="$agent" ;;
     esac
-    if command -v "$binary" >/dev/null 2>&1; then
+    if [ "$agent" = pi ] && ! standalone_pi; then
+      dropped=1
+      skip 'gentle-ai sync for pi — not a separate Pi installation and home'
+    elif command -v "$binary" >/dev/null 2>&1; then
       agents+=("$agent")
     else
       dropped=1
@@ -336,42 +333,133 @@ sync_gentle_ai_assets() {
     fi
   done < <(jq -r '.installed_agents[]?' "$state" 2>/dev/null)
 
-  if [ "$dropped" = 1 ] && [ ${#agents[@]} -gt 0 ]; then
-    gentle-ai sync --agents "$(IFS=,; printf '%s' "${agents[*]}")"
+  if [ "$dropped" = 1 ]; then
+    [ ${#agents[@]} -gt 0 ] || return 0
+    "$runtime" sync --agents "$(IFS=,; printf '%s' "${agents[*]}")"
   else
-    gentle-ai sync
+    "$runtime" sync
   fi
 }
 
-sync_gentle_ai_dev_override() {
-  local config_home="${GENTLE_PI_CONFIG_HOME:-$HOME/.pi/gentle-ai}"
-  local file="$config_home/dev-binary.json"
-  local target="$BIN_DIR/gentle-ai"
-
-  [ -f "$file" ] || return 0
-  [ -x "$target" ] || return 0
-
-  local declared
-  declared="$(rg -o '"path"[[:space:]]*:[[:space:]]*"[^"]+"' "$file" 2>/dev/null | rg -o '/[^"]+')"
-  [ -n "$declared" ] || return 0
-  [ -e "$declared" ] && return 0
-
-  printf '{"schema": "gentle-pi.dev-binary/v1", "path": "%s"}\n' "$target" > "$file"
-  ok "repaired gentle-pi dev binary override -> $target"
+# Read Go's embedded module metadata rather than guessing ownership from a
+# filename, and reject worktree/dev builds (their module version is (devel)).
+gentle_ai_build_version() {
+  go version -m "$1" 2>/dev/null | awk -v module="$GENTLE_AI_MODULE" '
+    $1 == "path" { main = $2 }
+    $1 == "mod" { pkg = $2; version = $3 }
+    END {
+      if ((pkg == module "/v4" || pkg == module "/v5") && main == pkg "/cmd/gentle-ai" &&
+          substr(version, 1, 2) == ("v" substr(pkg, length(pkg)))) print version
+      else exit 1
+    }'
 }
 
-# Install the launcher from its latest registry release. A launcher that was
-# installed from a git commit is replaced too: npm swaps it even when both
-# report the same version. Its commit record goes only after that succeeded,
-# so a failed install leaves gentle-rollback with an accurate record.
-install_gentle_shell() {
-  npm install --global --allow-scripts="$NPM_SCRIPT_ALLOWLIST" \
-    "${GENTLE_SHELL_NPM_PACKAGE}@latest" || return 1
-  hash -r 2>/dev/null || true
+install_gentle_ai() {
+  local bin="$BIN_DIR/gentle-ai" workdir
+  workdir="$(mktemp -d "$BIN_DIR/.gentle-ai-update.XXXXXX")" || return 1
+  if build_go_binary "$workdir" "$workdir" "$GENTLE_AI_PKG" &&
+      [ "$(gentle_ai_build_version "$workdir/gentle-ai")" = "$GENTLE_AI_VERSION" ] &&
+      answers_version "$workdir/gentle-ai" && [ ! -L "$bin" ] &&
+      mv -fT -- "$workdir/gentle-ai" "$bin"; then
+    AI_READY=1
+  fi
+  rm -rf -- "$workdir"
+  [ "$AI_READY" = 1 ]
+}
 
-  if ! rm -f "$GENTLE_SHELL_COMMIT_FILE"; then
-    warn "the launcher moved to the latest release but $GENTLE_SHELL_COMMIT_FILE could not be removed"
+in_shell_prefix() {
+  local path prefix
+  path="$(readlink -m -- "$1")" && prefix="$(readlink -m -- "$SHELL_PREFIX")" && [[ "$path/" == "$prefix/"* ]]
+}
+
+standalone_ai_version() {
+  local bin="$BIN_DIR/gentle-ai" path version
+  path="$(type -P gentle-ai || true)"
+  [ ! -L "$bin" ] && { [ -z "$path" ] || [ "$path" = "$bin" ]; } || return 1
+  [ -e "$bin" ] || return 0
+  [ -f "$bin" ] && [ -x "$bin" ] && [ -O "$bin" ] || return 1
+  version="$(gentle_ai_build_version "$bin")" && [[ "$version" =~ ^v$STABLE_VERSION$ ]] || return 1
+  printf '%s\n' "$version"
+}
+
+update_gentle_ai() {
+  local bin="$BIN_DIR/gentle-ai" version
+  if held gentle-ai || ! command -v go >/dev/null 2>&1; then
+    step gentle-ai 'gentle-ai (stable v5)' go install_gentle_ai
+  elif in_shell_prefix "$BIN_DIR" || in_shell_prefix "${GENTLE_AI_HOME:-$HOME/.gentle-ai}" ||
+      { [ -n "${GENTLE_AI_PI_CONFIG_DIR:-}" ] && in_shell_prefix "$GENTLE_AI_PI_CONFIG_DIR"; } ||
+      { [ -n "${GENTLE_PI_CONFIG_HOME:-}" ] && in_shell_prefix "$GENTLE_PI_CONFIG_HOME"; }; then
+    skip 'gentle-ai — bundled bin or state directory; use the Gentle Shell installation owner'
+  elif ! version="$(standalone_ai_version)"; then
+    skip 'gentle-ai — not a standalone installation in the update bin directory; use its installation owner'
+  elif [ "$version" = "$GENTLE_AI_VERSION" ] && answers_version "$bin"; then
+    AI_READY=1
+  elif [[ "$version" == v5.* && "$version" != "$GENTLE_AI_VERSION" ]]; then
+    skip "gentle-ai — installed $version is newer than the updater's $GENTLE_AI_VERSION pin"
+  else
+    step gentle-ai 'gentle-ai (stable v5)' go install_gentle_ai
+  fi
+}
+
+# Require the official prefix launcher, a completed active release, and the
+# exact pair that launcher reports. A shadowing npm/pnpm copy is not the bundle.
+bundled_shell_version() {
+  local path active id marker entry output
+  local versions="^gentle-shell ($STABLE_VERSION)"$'\n'"pi ($STABLE_VERSION)\$"
+  path="$(type -P gentle-shell)" && [ "$(readlink -f -- "$path")" = "$SHELL_LAUNCHER" ] || return 1
+  [ -O "$SHELL_PREFIX" ] && [ -O "$SHELL_LAUNCHER" ] && [ -x "$SHELL_LAUNCHER" ] || return 1
+  grep -Fxq '# gentle-shell bundled launcher (generated; do not edit)' "$SHELL_LAUNCHER" &&
+    grep -Fq "'$SHELL_PREFIX/current/node_modules/gentle-pi/bin/gentle-shell.mjs' \"\$@\"" "$SHELL_LAUNCHER" || return 1
+  [ -L "$SHELL_PREFIX/current" ] || return 1
+  active="$(readlink -f -- "$SHELL_PREFIX/current")" || return 1
+  id="${active##*/}"
+  marker="$active/.gentle-shell-version"
+  [ "$(readlink -- "$SHELL_PREFIX/current")" = "versions/$id" ] && [ "$active" = "$SHELL_PREFIX/versions/$id" ] &&
+    [ -f "$marker" ] && [ ! -L "$marker" ] && [ -O "$marker" ] &&
+    cmp -s "$marker" <(printf '%s\n' "$id") || return 1
+  entry="$(readlink -f -- "$active/node_modules/gentle-pi/bin/gentle-shell.mjs")" || return 1
+  [[ "$entry" = "$active/"* ]] && [ -f "$entry" ] || return 1
+  output="$(timeout 20 env -u GENTLE_SHELL_VERIFY_VERSION "$SHELL_LAUNCHER" --version 2>/dev/null </dev/null)" || return 1
+  [[ "$output" =~ $versions ]] &&
+    [ "$id" = "${BASH_REMATCH[1]}-${BASH_REMATCH[5]}" ] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+upgrade_gentle_shell() {
+  local expected="$1" actual
+  if ! run_pi_scoped "$SHELL_LAUNCHER" upgrade --channel release </dev/null; then
+    warn "Gentle Shell launcher — native upgrade failed; $SHELL_MANUAL"
     return 1
+  fi
+  actual="$(bundled_shell_version)" || actual=unverified
+  if [ "$actual" != "$expected" ]; then
+    warn "Gentle Shell launcher — expected active $expected after upgrade, found $actual; $SHELL_MANUAL"
+    return 1
+  fi
+  SHELL_UPGRADED=1
+}
+
+update_gentle_shell() {
+  local current latest
+  if held gentle-shell; then
+    skip 'Gentle Shell launcher — held by gentle-rollback (gentle-rollback unhold gentle-shell)'
+  elif ! current="$(bundled_shell_version)"; then
+    skip "Gentle Shell launcher — not a verified bundled PATH launcher; $SHELL_MANUAL"
+  elif [[ "$current" != [45].* || "$current" == 4.0.* ]]; then
+    skip "Gentle Shell launcher — unsupported launcher ($current); $SHELL_MANUAL"
+  # Match the upstream latestRelease source. This read cannot pin what the
+  # native command resolves later, so independently verify the active result.
+  elif ! latest="$(curl --disable --fail --silent --max-time 15 https://registry.npmjs.org/gentle-pi/latest |
+      jq -er 'select(.name == "gentle-pi") | .version' 2>/dev/null)" || [[ ! "$latest" =~ ^$STABLE_VERSION$ ]]; then
+    skip "Gentle Shell launcher — could not verify the official latest stable release; $SHELL_MANUAL"
+  elif [[ "$latest" != 5.* ]]; then
+    skip "Gentle Shell launcher — official latest stable is $latest, not v5; $SHELL_MANUAL"
+  elif [ "$current" = "$latest" ]; then
+    skip "Gentle Shell launcher — already current ($current)"
+  elif [ "$(printf '%s\n' "$current" "$latest" | sort -V | tail -1)" = "$current" ]; then
+    skip "Gentle Shell launcher — $current is newer than official latest $latest; $SHELL_MANUAL"
+  else
+    step gentle-shell 'Gentle Shell launcher (stable v5)' gentle-shell upgrade_gentle_shell "$latest"
   fi
 }
 
@@ -484,11 +572,11 @@ sync_herdr_plugin() {
 }
 
 sync_herdr_extension() {
-  if gentle-shell --isolated list 2>/dev/null | grep -qF "$HERDR_GS_EXTENSION"; then
+  if "$SHELL_LAUNCHER" --isolated list 2>/dev/null | grep -qF "$HERDR_GS_EXTENSION"; then
     # Already declared: `update --extensions` above refreshed it.
     return 0
   fi
-  run_pi_scoped gentle-shell --isolated install "$HERDR_GS_EXTENSION"
+  run_pi_scoped "$SHELL_LAUNCHER" --isolated install "$HERDR_GS_EXTENSION"
 }
 
 # Herdr's per-agent integrations (the hook or extension it drops into each
@@ -509,7 +597,9 @@ update_herdr_gentle_shell() {
   command -v herdr >/dev/null 2>&1 || return 0
   step herdr-integrations "Herdr agent integrations" herdr sync_herdr_integrations
   step herdr-plugin "Herdr plugins ($HERDR_GS_PLUGIN + sidebar)" herdr sync_herdr_plugin
-  step gentle-shell "Gentle Shell extension $HERDR_GS_EXTENSION" gentle-shell sync_herdr_extension
+  if [ "$SHELL_UPGRADED" = 1 ]; then
+    step gentle-shell "Gentle Shell extension $HERDR_GS_EXTENSION" gentle-shell sync_herdr_extension
+  fi
 }
 
 # Codex only has marketplace upgrades in recent builds; an older one is skipped
@@ -580,8 +670,7 @@ npm_component() {
 # A blanket `npm update -g` would also bump packages whose component is held,
 # so the packages are named one by one and the held ones are left out.
 #
-# The Gentle Shell launcher is left out as well, held or not: it has its own
-# step, which installs the latest release.
+# Never change a global Gentle Shell launcher: only its owner may do that.
 update_npm_globals() {
   local listing names pkg pkgs=()
   # A listing that does not parse is not an empty listing: fail the step
@@ -604,7 +693,7 @@ update_npm_globals() {
   while read -r pkg; do
     [ -n "$pkg" ] || continue
     if [ "$pkg" = "$GENTLE_SHELL_NPM_PACKAGE" ]; then
-      printf '  leaving %s alone (installed by the launcher step)\n' "$pkg"
+      printf '  leaving %s alone (managed by its installation owner)\n' "$pkg"
       continue
     fi
     if held "$(npm_component "$pkg")"; then
@@ -634,11 +723,27 @@ update_pnpm_globals() {
   fi
   # Resolve pnpm before touching PATH: the global bin directory holds a stale
   # pnpm shim that would otherwise win the lookup and fail to exec.
-  local pnpm_bin
+  local pnpm_bin listing names pkg packages=()
   pnpm_bin="$(command -v pnpm)" || return 1
-
-  PNPM_HOME="$PNPM_GLOBAL_HOME" PATH="$PNPM_GLOBAL_HOME/bin:$PATH" \
-    "$pnpm_bin" update -g
+  local -x PNPM_HOME="$PNPM_GLOBAL_HOME" PATH="$PNPM_GLOBAL_HOME/bin:$PATH"
+  # Always pass explicit names, even if the listing did not contain gentle-pi.
+  if ! listing="$("$pnpm_bin" ls -g --depth=0 --json)" ||
+      ! names="$(jq -rs --arg shell "$GENTLE_SHELL_NPM_PACKAGE" '
+        if length != 1 or (.[0] | type) != "array" then error("not a package listing") else .[0] end
+        | [ .[] | (.dependencies // {}) | to_entries[] ] | group_by(.key)[]
+        | if any(.[]; .key == $shell or .value.from == $shell or .value.name == $shell)
+          then "!" else .[0].key end' <<<"$listing" 2>/dev/null)"; then
+    warn 'pnpm printed no usable global package list; pnpm globals were not updated'
+    return 1
+  fi
+  while read -r pkg; do
+    case "$pkg" in
+      '') ;;
+      '!') printf '  leaving gentle-pi alone (managed by its installation owner)\n' ;;
+      *) packages+=("$pkg") ;;
+    esac
+  done <<<"$names"
+  if [ "${#packages[@]}" -gt 0 ]; then "$pnpm_bin" update -g "${packages[@]}"; fi
 }
 
 # Names of the features `moshi-hook doctor --json` reports as ok, one per line.
@@ -672,13 +777,15 @@ update_moshi_hook() {
     case "$agent" in
       "") ;;
       pi)
-        # Pi hooks live inside a Pi home, and there are two of them. doctor
-        # reports `pi` as one agent and only looks at the standard home, so
-        # every home that exists gets its own install.
-        for home in "${PI_HOMES[@]}"; do
-          [ -d "$home" ] || continue
+        # doctor only reports the standard Pi home. Refresh the isolated
+        # home as well only when this run selected and upgraded its Shell.
+        home="${PI_HOMES[0]}"
+        if standalone_pi_home && [ -d "$home" ]; then
           PI_CODING_AGENT_DIR="$home" moshi-hook install --target pi || status=1
-        done
+        fi
+        if shell_home_selected && [ -d "${PI_HOMES[1]}" ]; then
+          PI_CODING_AGENT_DIR="${PI_HOMES[1]}" moshi-hook install --target pi || status=1
+        fi
         ;;
       *)
         if ! command -v "$agent" >/dev/null 2>&1; then
@@ -837,6 +944,15 @@ smoke_check() {
     warn "$tool no longer runs after the update"
     note_version_failure "$tool"
 
+    if [ "$tool" = gentle-shell ]; then
+      # Snapshot restore is the legacy npm path, not a native release switch.
+      if [ -n "$ROLLBACK" ] && ! held gentle-shell; then
+        hold_broken gentle-shell 'stopped working after an update; needs native recovery'
+      fi
+      FAILED+=("$tool broke after the update; use native 'gentle-shell upgrade --rollback' if available; otherwise $SHELL_MANUAL")
+      continue
+    fi
+
     if [ -z "$SNAPSHOT_ID" ]; then
       FAILED+=("$tool broke after the update; not rolled back (no snapshot)")
       continue
@@ -893,6 +1009,24 @@ for tool in jq flock sha256sum timeout rg; do
 done
 
 wants() { [ "$TARGET" = all ] || [ "$TARGET" = "$1" ]; }
+shell_home_selected() { [ "$SHELL_UPGRADED" = 1 ] && { wants agents || wants toolchain; }; }
+standalone_pi_home() {
+  local home
+  home="$(readlink -m -- "${PI_HOMES[0]}")" || return 1
+  ! in_shell_prefix "$home" && [ "$home" != "$(readlink -m -- "${PI_HOMES[1]}")" ]
+}
+standalone_pi() {
+  local path
+  path="$(type -P pi || true)"
+  standalone_pi_home && { [ -z "$path" ] || ! in_shell_prefix "$path"; }
+}
+
+apply_pi_npm_policy() {
+  if ! configure_pi_npm_policy "$1"; then
+    FAILED+=("npm project policy: $1")
+    warn "failed to configure npm install-script policy for $1"
+  fi
+}
 
 # Started before the lock is taken, so the log writers never inherit it.
 start_log "$@"
@@ -966,7 +1100,11 @@ elif [ -z "$ROLLBACK" ]; then
   warn "(set GENTLE_UPDATE_NO_SNAPSHOT=1 to update without a snapshot)"
   exit 1
 elif SNAPSHOT_ID="$("$ROLLBACK" snapshot --reason "pre-update ($TARGET)" 9>&-)" && [ -n "$SNAPSHOT_ID" ]; then
-  ok "snapshot $SNAPSHOT_ID (undo with: gentle-rollback restore $SNAPSHOT_ID)"
+  if wants agents || wants toolchain || wants packages; then
+    ok "snapshot $SNAPSHOT_ID (undo supported components with: gentle-rollback restore $SNAPSHOT_ID)"
+  else
+    ok "snapshot $SNAPSHOT_ID (undo with: gentle-rollback restore $SNAPSHOT_ID)"
+  fi
 else
   warn "the pre-update snapshot failed; nothing was updated"
   warn "(set GENTLE_UPDATE_NO_SNAPSHOT=1 to update without a snapshot)"
@@ -975,31 +1113,28 @@ fi
 
 if wants agents || wants toolchain; then
   heading "Pi / Gentle Shell npm project policy"
-  # Both Pi homes use npm --prefix, so set policy BEFORE Pi update / setup.
-  # Package-local package.json#allowScripts, never user-wide npm policy.
-  for home in "${PI_HOMES[@]}"; do
-    if ! configure_pi_npm_policy "$home"; then
-      FAILED+=("npm project policy: $home")
-      warn "failed to configure npm install-script policy for $home"
-    fi
-  done
-fi
-
-if wants agents || wants toolchain || wants packages; then
-  heading "Gentle Shell standalone launcher"
-  step gentle-shell "Gentle Shell launcher (latest release)" npm install_gentle_shell
+  if ! held pi && standalone_pi_home; then apply_pi_npm_policy "${PI_HOMES[0]}"; fi
 fi
 
 if wants agents || wants toolchain; then
-  heading "Gentle Shell isolated home"
-  if wants agents; then
-    # --all also refreshes the packages the plain `pi` home declares, so it
-    # never lags behind the isolated Gentle Shell home.
+  heading "Gentle Shell standalone launcher"
+  update_gentle_shell
+fi
+
+if wants agents; then
+  if ! standalone_pi; then
+    skip 'PATH Pi runtime + extensions — not a separate Pi installation and home'
+  else
+    # --all refreshes the plain Pi runtime and packages, but not its catalog.
     step pi "PATH Pi runtime + extensions" pi run_pi_scoped pi update --all
-    # --all does not touch the model catalogs; those have their own flag.
     step pi "Pi model catalog" pi pi update --models
   fi
-  step gentle-shell "Gentle Shell setup" gentle-shell run_pi_scoped gentle-shell --isolated setup
+fi
+if shell_home_selected; then
+  heading "Gentle Shell isolated home"
+  apply_pi_npm_policy "${PI_HOMES[1]}"
+  step gentle-shell "Gentle Shell setup" gentle-shell run_pi_scoped "$SHELL_LAUNCHER" --isolated setup
+  step gentle-shell "Gentle Shell extensions" gentle-shell run_pi_scoped "$SHELL_LAUNCHER" --isolated update --extensions
 fi
 
 if wants agents; then
@@ -1007,18 +1142,20 @@ if wants agents; then
   step claude   "Claude Code" claude   claude update
   step codex    "Codex"       codex    codex update
   step codex-plugins "Codex plugin marketplaces" codex update_codex_plugins
-  step gentle-shell "Gentle Shell extensions"    gentle-shell run_pi_scoped gentle-shell --isolated update --extensions
-  step gentle-shell "Gentle Shell model catalog" gentle-shell gentle-shell --isolated update --models
+  if [ "$SHELL_UPGRADED" = 1 ]; then
+    step gentle-shell "Gentle Shell model catalog" gentle-shell "$SHELL_LAUNCHER" --isolated update --models
+  fi
   update_herdr
   update_herdr_gentle_shell
 fi
 
 if wants toolchain; then
   heading "Gentleman toolchain (latest release)"
-  step gentle-ai "gentle-ai" go install_go_binary gentle-ai "$GENTLE_AI_PKG"
-  step engram    "engram"    go install_go_binary engram    "$ENGRAM_PKG"
-  step gentle-ai "gentle-ai sync" gentle-ai sync_gentle_ai_assets
-  sync_gentle_ai_dev_override
+  update_gentle_ai
+  step engram "engram" go install_go_binary engram "$ENGRAM_PKG"
+  if [ "$AI_READY" = 1 ]; then
+    step gentle-ai "gentle-ai sync" gentle-ai sync_gentle_ai_assets "$BIN_DIR/gentle-ai"
+  fi
 fi
 
 if wants plugins; then
@@ -1042,8 +1179,10 @@ fi
 
 hash -r 2>/dev/null || true
 
-dedupe_gentle_shell_home
-sync_gentle_shell_mcp
+if shell_home_selected; then
+  dedupe_gentle_shell_home
+  sync_gentle_shell_mcp
+fi
 check_pi_homes
 smoke_check
 
